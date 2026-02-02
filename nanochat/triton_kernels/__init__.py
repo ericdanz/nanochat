@@ -4,6 +4,10 @@ from nanochat.triton_kernels.look_around_attention import (
     look_around_conv_triton,
     look_around_conv_pytorch,
 )
+from nanochat.triton_kernels.look_around_v_conv import (
+    look_around_v_conv,
+    LookAroundVConv,
+)
 
 # Try to import kernel strategy functions (only available when Triton is available)
 try:
@@ -27,4 +31,6 @@ __all__ = [
     "look_around_conv_pytorch",
     "set_triton_kernel_strategy",
     "get_triton_kernel_strategy",
+    "look_around_v_conv",
+    "LookAroundVConv",
 ]

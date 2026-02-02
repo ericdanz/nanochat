@@ -25,8 +25,8 @@ from nanochat.common import get_dist_info, print0
 from nanochat.flash_attention import flash_attn
 from nanochat.optim import DistMuonAdamW, MuonAdamW
 
-# Triton-accelerated look-around attention (with PyTorch fallback)
-from nanochat.triton_kernels import look_around_conv_triton, look_around_conv_pytorch
+# V-convolution look-around attention (memory efficient, uses Flash Attention)
+from nanochat.triton_kernels import look_around_v_conv
 
 
 @dataclass
@@ -65,45 +65,6 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-def look_around_conv(
-    attn_weights: torch.Tensor, proj_logits: torch.Tensor
-) -> torch.Tensor:
-    """
-    Apply "look around" convolution to attention weights, respecting causality.
-
-    The convolution allows each position to "spread" its attention bidirectionally:
-    - 2 positions left (K-2, K-1)
-    - Current position (K)
-    - 2 positions right (K+1, K+2)
-
-    Kernel index mapping (5 elements):
-        Index 0: K-2 (2 positions left)
-        Index 1: K-1 (1 position left)
-        Index 2: K   (center - current position)
-        Index 3: K+1 (1 position right)
-        Index 4: K+2 (2 positions right)
-
-    For simplicity, this implementation:
-    1. Applies the full 5-element convolution
-    2. Zeros out the upper triangle (causality)
-    3. Renormalizes to sum to 1
-
-    The boundary corrections from the original look_right implementation are not
-    needed here because we simply mask and renormalize.
-
-    Args:
-        attn_weights: (B, H, T_q, T_k) post-softmax attention weights (sum to 1 along T_k)
-        proj_logits: (H, 5) learnable projection logits per head
-
-    Returns:
-        (B, H, T_q, T_k) convolved attention weights, summing to 1
-    """
-    # Dispatch to Triton on CUDA, PyTorch on CPU
-    if attn_weights.is_cuda:
-        return look_around_conv_triton(attn_weights, proj_logits)
-    return look_around_conv_pytorch(attn_weights, proj_logits)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -124,69 +85,15 @@ class CausalSelfAttention(nn.Module):
             if has_ve(layer_idx, config.n_layer)
             else None
         )
-        # Look-around attention: learnable projection for first N heads
+        # Look-around attention via V-convolution: learnable projection for KV heads
+        # Unlike the old attention-matrix convolution, this applies to V before Flash Attention
+        # Memory: O(T*D) instead of O(T^2) - enables Flash Attention with look-around!
         self.n_look_around_heads = config.n_look_around_heads
         self.look_around_proj = (
-            nn.Parameter(torch.zeros(config.n_look_around_heads, 5))
+            nn.Parameter(torch.zeros(config.n_kv_head, 5))
             if config.n_look_around_heads > 0
             else None
         )
-
-    def _manual_attention_with_look_around(self, q, k, v, window_size):
-        """
-        Manual attention computation with look-around convolution on first N heads.
-
-        Args:
-            q: (B, T, H_q, D) queries (already with rotary + QK norm applied)
-            k: (B, T, H_kv, D) keys
-            v: (B, T, H_kv, D) values
-            window_size: (left, right) tuple for sliding window
-
-        Returns:
-            (B, T, H_q, D) attention output
-        """
-        B, T, H_q, D = q.shape
-        H_kv = k.shape[2]
-
-        # Expand k, v for GQA: (B, T, H_kv, D) -> (B, T, H_q, D)
-        n_rep = H_q // H_kv
-        if n_rep > 1:
-            k = k.unsqueeze(3).expand(B, T, H_kv, n_rep, D).reshape(B, T, H_q, D)
-            v = v.unsqueeze(3).expand(B, T, H_kv, n_rep, D).reshape(B, T, H_q, D)
-
-        # Transpose to (B, H, T, D) for attention computation
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Compute attention scores
-        scale = D**-0.5
-        attn = (q @ k.transpose(-2, -1)) * scale  # (B, H_q, T, T)
-
-        # Build causal mask with optional sliding window
-        window = window_size[0]
-        row_idx = torch.arange(T, device=q.device).unsqueeze(1)
-        col_idx = torch.arange(T, device=q.device).unsqueeze(0)
-        mask = col_idx > row_idx  # causal: can't attend to future
-        if window >= 0 and window < T:
-            mask = mask | ((row_idx - col_idx) > window)  # sliding window
-        attn = attn.masked_fill(mask, float("-inf"))
-
-        # Softmax
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply look-around convolution to first N heads
-        N = self.n_look_around_heads
-        if N > 0:
-            attn_affected = attn[:, :N, :, :]
-            attn_affected = look_around_conv(attn_affected, self.look_around_proj)
-            attn = torch.cat([attn_affected, attn[:, N:, :, :]], dim=1)
-
-        # Apply to values
-        y = attn @ v  # (B, H_q, T, D)
-
-        # Transpose back to (B, T, H_q, D)
-        return y.transpose(1, 2)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -210,12 +117,15 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)  # QK norm
 
-        # Choose attention implementation based on look-around and cache
-        if self.look_around_proj is not None and kv_cache is None:
-            # Training with look-around: use manual attention (can't use Flash Attention)
-            y = self._manual_attention_with_look_around(q, k, v, window_size)
-        elif kv_cache is None:
-            # Training without look-around: use Flash Attention
+        # Apply V-convolution for look-around attention (before Flash Attention)
+        # This is mathematically equivalent to convolving the attention matrix,
+        # but operates on O(T*D) instead of O(T^2) memory
+        if self.look_around_proj is not None:
+            v = look_around_v_conv(v, self.look_around_proj)
+
+        # Choose attention implementation
+        if kv_cache is None:
+            # Training: use Flash Attention (works with V-convolution!)
             y = flash_attn.flash_attn_func(
                 q, k, v, causal=True, window_size=window_size
             )
@@ -399,6 +309,10 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+            # Cast look_around_proj to bf16 to match v tensor dtype and ensure gradient flow
+            for block in self.transformer.h:
+                if block.attn.look_around_proj is not None:
+                    block.attn.look_around_proj.data = block.attn.look_around_proj.data.bfloat16()
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
