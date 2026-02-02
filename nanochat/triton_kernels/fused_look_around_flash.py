@@ -58,7 +58,7 @@ if TRITON_AVAILABLE:
 
         Key fixes:
         1. Compute global max over ALL shifted QK arrays before exp() to prevent overflow
-        2. Use a wider K load to reduce redundant memory traffic
+        2. Re-apply causal mask after convolution to ensure correctness
         """
         pid_m = tl.program_id(0)
         pid_bh = tl.program_id(1)

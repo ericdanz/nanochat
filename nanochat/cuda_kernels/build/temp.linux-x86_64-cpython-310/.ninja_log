@@ -1,0 +1,3 @@
+# ninja log v7
+0	15837	1770072232771211371	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/bindings.o	394f72e3ac346a62
+0	59362	1770072232772555887	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	9f4f938cfca79c7c
