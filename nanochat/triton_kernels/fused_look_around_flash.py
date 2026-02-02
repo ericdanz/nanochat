@@ -20,6 +20,7 @@ The convolution formula applied to each row of attention scores:
 import torch
 import torch.nn.functional as F
 import math
+from typing import Tuple
 
 try:
     import triton
@@ -761,7 +762,7 @@ if TRITON_AVAILABLE:
             v: torch.Tensor,
             proj_logits: torch.Tensor,
             causal: bool,
-        ) -> tuple:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """Forward primitive - launches Triton kernel and returns (out, L, proj_5)."""
             B, H, T_q, D = q.shape
             T_k = k.shape[2]
@@ -833,7 +834,7 @@ if TRITON_AVAILABLE:
             out: torch.Tensor,
             L: torch.Tensor,
             causal: bool,
-        ) -> tuple:
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             """Backward primitive - launches Triton kernel and returns gradients."""
             grad_out = grad_out.contiguous()
             B, H, T_q, D = q.shape
