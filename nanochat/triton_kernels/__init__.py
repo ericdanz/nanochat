@@ -26,6 +26,19 @@ except ImportError:
 
     _run_kernel_directly = None
 
+# Import fused Flash Attention with look-around convolution
+try:
+    from nanochat.triton_kernels.fused_look_around_flash import (
+        fused_look_around_flash_attention,
+        fused_look_around_flash_attention_reference,
+    )
+except ImportError:
+    # Triton not available
+    def fused_look_around_flash_attention(*args, **kwargs):
+        raise RuntimeError("Triton is not available for fused kernel.")
+
+    fused_look_around_flash_attention_reference = None
+
 __all__ = [
     "look_around_conv_triton",
     "look_around_conv_pytorch",
@@ -33,4 +46,6 @@ __all__ = [
     "get_triton_kernel_strategy",
     "look_around_v_conv",
     "LookAroundVConv",
+    "fused_look_around_flash_attention",
+    "fused_look_around_flash_attention_reference",
 ]
