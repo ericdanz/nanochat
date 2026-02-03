@@ -381,6 +381,16 @@ void launch_fused_look_around_flash_fwd(
                     BLOCK_M * 128 * 4 +          // acc_smem
                     5 * 4;                        // w_shared
 
+        // Set max dynamic shared memory if needed
+        if (smem_size > props.sharedMemPerBlock) {
+            cudaFuncSetAttribute(
+                causal ? fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 128, true>
+                       : fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 128, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_size
+            );
+        }
+
         if (causal) {
             fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 128, true>
                 <<<grid, block, smem_size, stream>>>(

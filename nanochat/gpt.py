@@ -28,6 +28,14 @@ from nanochat.optim import DistMuonAdamW, MuonAdamW
 # V-convolution look-around attention (memory efficient, uses Flash Attention)
 from nanochat.triton_kernels import look_around_v_conv
 
+# CUDA kernel for fused look-around flash attention (P-conv on attention scores)
+try:
+    from nanochat.cuda_kernels import fused_look_around_flash_attention_cuda, is_cuda_kernel_available
+    CUDA_LOOK_AROUND_AVAILABLE = is_cuda_kernel_available()
+except ImportError:
+    CUDA_LOOK_AROUND_AVAILABLE = False
+    fused_look_around_flash_attention_cuda = None
+
 
 @dataclass
 class GPTConfig:
@@ -117,18 +125,32 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)  # QK norm
 
-        # Apply V-convolution for look-around attention (before Flash Attention)
-        # This is mathematically equivalent to convolving the attention matrix,
-        # but operates on O(T*D) instead of O(T^2) memory
-        if self.look_around_proj is not None:
-            v = look_around_v_conv(v, self.look_around_proj)
-
         # Choose attention implementation
         if kv_cache is None:
-            # Training: use Flash Attention (works with V-convolution!)
-            y = flash_attn.flash_attn_func(
-                q, k, v, causal=True, window_size=window_size
-            )
+            # Training mode
+            if self.look_around_proj is not None and CUDA_LOOK_AROUND_AVAILABLE:
+                # Use fused CUDA kernel for look-around attention (P-conv on attention scores)
+                # CUDA kernel expects (B, H, T, D) layout, FA3 uses (B, T, H, D)
+                q_t = q.transpose(1, 2).contiguous()  # (B, H, T, D)
+                k_t = k.transpose(1, 2).contiguous()
+                v_t = v.transpose(1, 2).contiguous()
+                y = fused_look_around_flash_attention_cuda(
+                    q_t, k_t, v_t, self.look_around_proj, causal=True
+                )
+                y = y.transpose(1, 2)  # Back to (B, T, H, D)
+            elif self.look_around_proj is not None:
+                # Fallback: V-convolution + Flash Attention
+                # This is mathematically equivalent to convolving the attention matrix,
+                # but operates on O(T*D) instead of O(T^2) memory
+                v = look_around_v_conv(v, self.look_around_proj)
+                y = flash_attn.flash_attn_func(
+                    q, k, v, causal=True, window_size=window_size
+                )
+            else:
+                # Standard Flash Attention (no look-around)
+                y = flash_attn.flash_attn_func(
+                    q, k, v, causal=True, window_size=window_size
+                )
         else:
             # Inference: use flash_attn_with_kvcache (no look-around during inference)
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
@@ -294,10 +316,18 @@ class GPT(nn.Module):
         # Look-around projection: init close to identity but not saturated
         # Using smaller values allows gradient flow while still starting near identity
         # [-2, -2, 2, -2, -2] gives softmax ~[0.02, 0.02, 0.92, 0.02, 0.02]
+        # For heads beyond n_look_around_heads, use extreme values to force true identity
+        # with no gradient flow (softmax saturates to [0, 0, 1, 0, 0])
         for block in self.transformer.h:
             if block.attn.look_around_proj is not None:
-                block.attn.look_around_proj.data.fill_(-2.0)
-                block.attn.look_around_proj.data[:, 2] = 2.0
+                n_la = self.config.n_look_around_heads
+                # Trainable look-around heads: moderate values for gradient flow
+                block.attn.look_around_proj.data[:n_la].fill_(-2.0)
+                block.attn.look_around_proj.data[:n_la, 2] = 2.0
+                # Non-look-around heads: extreme values → true identity, no gradients
+                if n_la < self.config.n_kv_head:
+                    block.attn.look_around_proj.data[n_la:].fill_(-1e9)
+                    block.attn.look_around_proj.data[n_la:, 2] = 1e9
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head

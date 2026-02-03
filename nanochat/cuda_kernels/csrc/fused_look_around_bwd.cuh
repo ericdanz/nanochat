@@ -257,8 +257,11 @@ __global__ void fused_look_around_flash_bwd_kernel(
                 }
             }
 
-            // 4. Compute dP_conv_raw = dO @ V^T, then apply normalization backward
-            //    dP_conv_grad = P_conv * (dP_conv_raw - D_i)
+            // 4. Compute dP_conv_raw = dO @ V^T
+            //    The backward through normalization O = conv_exp @ V / L gives:
+            //    d(conv_exp)[j] = (dO @ V[j] - D_i) / L
+            //    Since P_halo = exp(S-m)/L, when we multiply by P_halo later,
+            //    the L cancels out. So we just compute (dp_raw - D_i) here.
             for (int n = 0; n < BLOCK_N; n++) {
                 int v_pos = k_block_start + n;
                 if (v_pos >= T_k || (IS_CAUSAL && v_pos > q_pos)) {
@@ -273,8 +276,8 @@ __global__ void fused_look_around_flash_bwd_kernel(
                     dp_raw += do_val * v_val;
                 }
 
-                // FIX #1: Proper backward through normalization
-                dP_conv_grad[n] = P_conv[n] * (dp_raw - d_i);
+                // Gradient w.r.t. conv_exp (unnormalized), but L will cancel later
+                dP_conv_grad[n] = dp_raw - d_i;
             }
 
             // 5. Transposed convolution: dP_conv_grad -> dP_halo
@@ -298,17 +301,13 @@ __global__ void fused_look_around_flash_bwd_kernel(
                 dP_halo[n_halo] = dp;
             }
 
-            // 6. Unified softmax backward
-            // FIX #3: Single softmax backward after combining all dP contributions
-            // dS = P * (dP - sum(P * dP))
-            float row_sum_p_dp = 0.0f;
-            for (int n = 0; n < BLOCK_N + 4; n++) {
-                row_sum_p_dp += P_halo[n] * dP_halo[n];
-            }
-
-            // 7. Compute dS and accumulate dQ and dK
+            // 6. Compute dS and accumulate dQ and dK
+            // Since normalization happens AFTER convolution (not before as in standard softmax),
+            // and we've already accounted for it in dP_conv_grad, the backward through
+            // exp(S-m) is simply: dS = P_halo * dP_halo (where P_halo = exp(S-m)/L)
+            // The L cancels with the 1/L from dP_conv_grad.
             for (int n_halo = 0; n_halo < BLOCK_N + 4; n_halo++) {
-                float dS_val = P_halo[n_halo] * (dP_halo[n_halo] - row_sum_p_dp);
+                float dS_val = P_halo[n_halo] * dP_halo[n_halo];
                 dS_val *= sm_scale;
 
                 if (fabsf(dS_val) < 1e-10f) continue;
@@ -448,6 +447,16 @@ void launch_fused_look_around_flash_bwd(
                     BLOCK_M * 128 * 4 +
                     5 * 4 +
                     5 * 4;
+
+        // Set max dynamic shared memory if needed
+        if (smem_size > props.sharedMemPerBlock) {
+            cudaFuncSetAttribute(
+                causal ? fused_look_around_flash_bwd_kernel<BLOCK_M, BLOCK_N, 128, true>
+                       : fused_look_around_flash_bwd_kernel<BLOCK_M, BLOCK_N, 128, false>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_size
+            );
+        }
 
         if (causal) {
             fused_look_around_flash_bwd_kernel<BLOCK_M, BLOCK_N, 128, true>

@@ -18,7 +18,7 @@ Usage:
 import torch
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 # Try to import the CUDA extension
 try:
@@ -28,52 +28,93 @@ except ImportError:
     CUDA_KERNEL_AVAILABLE = False
 
 
+# Register custom op for torch.compile compatibility
+if CUDA_KERNEL_AVAILABLE:
+    # Define the custom op using torch.library
+    @torch.library.custom_op("fused_look_around::attention", mutates_args=())
+    def _fused_look_around_attention_op(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        proj_weights: torch.Tensor,
+        causal: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward op - returns (out, lse)"""
+        out, lse = fused_look_around_flash_cuda.forward(q, k, v, proj_weights, causal)
+        return out, lse
+
+    @_fused_look_around_attention_op.register_fake
+    def _fused_look_around_attention_fake(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        proj_weights: torch.Tensor,
+        causal: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Fake implementation for torch.compile shape inference"""
+        B, H, T_q, D = q.shape
+        out = q.new_empty((B, H, T_q, D))
+        lse = q.new_empty((B, H, T_q), dtype=torch.float32)
+        return out, lse
+
+    def _fused_look_around_attention_backward(
+        ctx,
+        grad_out: torch.Tensor,
+        grad_lse: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        """Backward implementation for the custom op"""
+        q, k, v, out, lse, proj_weights = ctx.saved_tensors
+        causal = ctx.causal
+
+        grad_out = grad_out.contiguous().to(torch.bfloat16)
+
+        grad_q, grad_k, grad_v, grad_proj_weights = fused_look_around_flash_cuda.backward(
+            grad_out, q, k, v, out, lse, proj_weights, causal
+        )
+
+        return grad_q, grad_k, grad_v, grad_proj_weights, None
+
+    def _fused_look_around_attention_setup_context(
+        ctx,
+        inputs: Tuple,
+        output: Tuple[torch.Tensor, torch.Tensor],
+    ):
+        """Save tensors for backward"""
+        q, k, v, proj_weights, causal = inputs
+        out, lse = output
+        ctx.save_for_backward(q, k, v, out, lse, proj_weights)
+        ctx.causal = causal
+
+    # Register autograd for the custom op
+    _fused_look_around_attention_op.register_autograd(
+        _fused_look_around_attention_backward,
+        setup_context=_fused_look_around_attention_setup_context,
+    )
+
+
 class FusedLookAroundFlashCUDAFunction(torch.autograd.Function):
     """
     Autograd function for fused look-around flash attention (CUDA implementation).
 
-    This implements the correct backward pass, fixing the bugs in the Triton version:
-    1. Proper backward through normalization (D_i = dot(dO, O))
-    2. Correct transposed convolution with index shifting
-    3. Unified softmax backward after transposed convolution
+    This is the fallback for when torch.compile is not used.
     """
 
     @staticmethod
     def forward(
         ctx,
-        q: torch.Tensor,        # (B, H, T_q, D)
-        k: torch.Tensor,        # (B, H, T_k, D)
-        v: torch.Tensor,        # (B, H, T_k, D)
-        proj_logits: torch.Tensor,  # (H, 5) raw logits
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        proj_logits: torch.Tensor,
         causal: bool = True
     ) -> torch.Tensor:
-        """
-        Forward pass of fused look-around flash attention.
-
-        Args:
-            q: Query tensor (B, H, T_q, D), will be converted to bfloat16
-            k: Key tensor (B, H, T_k, D), will be converted to bfloat16
-            v: Value tensor (B, H, T_k, D), will be converted to bfloat16
-            proj_logits: Projection logits (H, 5), will be softmaxed internally
-            causal: Whether to apply causal masking
-
-        Returns:
-            Output tensor (B, H, T_q, D) in bfloat16
-        """
-        # Ensure inputs are contiguous and in the right dtype
         q = q.contiguous().to(torch.bfloat16)
         k = k.contiguous().to(torch.bfloat16)
         v = v.contiguous().to(torch.bfloat16)
-
-        # Softmax the projection logits
         proj_weights = F.softmax(proj_logits.float(), dim=-1).contiguous()
 
-        # Call CUDA forward
-        out, lse = fused_look_around_flash_cuda.forward(
-            q, k, v, proj_weights, causal
-        )
+        out, lse = fused_look_around_flash_cuda.forward(q, k, v, proj_weights, causal)
 
-        # Save for backward
         ctx.save_for_backward(q, k, v, out, lse, proj_weights, proj_logits)
         ctx.causal = causal
 
@@ -81,22 +122,16 @@ class FusedLookAroundFlashCUDAFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """
-        Backward pass with corrected gradient computation.
-        """
         q, k, v, out, lse, proj_weights, proj_logits = ctx.saved_tensors
         causal = ctx.causal
 
-        # Ensure grad_output is contiguous and bfloat16
         grad_output = grad_output.contiguous().to(torch.bfloat16)
 
-        # Call CUDA backward
         grad_q, grad_k, grad_v, grad_proj_weights = fused_look_around_flash_cuda.backward(
             grad_output, q, k, v, out, lse, proj_weights, causal
         )
 
         # Backward through softmax for proj_logits
-        # grad_proj_logits = proj_weights * (grad_proj_weights - sum(grad_proj_weights * proj_weights))
         dot_product = (grad_proj_weights * proj_weights).sum(dim=-1, keepdim=True)
         grad_proj_logits = proj_weights * (grad_proj_weights - dot_product)
         grad_proj_logits = grad_proj_logits.to(proj_logits.dtype)
@@ -114,13 +149,7 @@ def fused_look_around_flash_attention_cuda(
     """
     Fused look-around flash attention using native CUDA kernel.
 
-    This function applies a 5-tap convolution to attention scores before
-    computing the weighted sum of values. It uses a memory-efficient
-    flash attention style algorithm that avoids O(N^2) memory usage.
-
-    The convolution formula applied to each row of attention scores:
-        P_conv[j] = w0*P[j+2] + w1*P[j+1] + w2*P[j] + w3*P[j-1] + w4*P[j-2]
-    where P = softmax(QK^T / sqrt(d_k)) and w = softmax(proj_logits)
+    Compatible with torch.compile - uses registered custom op when compiled.
 
     Args:
         q: Query tensor of shape (B, H, T_q, D)
@@ -131,9 +160,6 @@ def fused_look_around_flash_attention_cuda(
 
     Returns:
         Output tensor of shape (B, H, T_q, D)
-
-    Raises:
-        RuntimeError: If the CUDA kernel is not available (not built)
     """
     if not CUDA_KERNEL_AVAILABLE:
         raise RuntimeError(
@@ -143,6 +169,29 @@ def fused_look_around_flash_attention_cuda(
             "from nanochat.triton_kernels.fused_look_around_flash import fused_look_around_flash_attention"
         )
 
+    # Prepare inputs
+    q = q.contiguous().to(torch.bfloat16)
+    k = k.contiguous().to(torch.bfloat16)
+    v = v.contiguous().to(torch.bfloat16)
+    proj_weights = F.softmax(proj_logits.float(), dim=-1).contiguous()
+
+    # Use the registered custom op (works with torch.compile)
+    out, lse = torch.ops.fused_look_around.attention(q, k, v, proj_weights, causal)
+
+    return out
+
+
+# Keep the old function as fallback for non-compiled usage
+def fused_look_around_flash_attention_cuda_legacy(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    proj_logits: torch.Tensor,
+    causal: bool = True,
+) -> torch.Tensor:
+    """Legacy version using autograd.Function directly."""
+    if not CUDA_KERNEL_AVAILABLE:
+        raise RuntimeError("CUDA kernel not available.")
     return FusedLookAroundFlashCUDAFunction.apply(q, k, v, proj_logits, causal)
 
 
