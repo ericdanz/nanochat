@@ -50,6 +50,7 @@ __device__ __forceinline__ float warp_reduce_sum_fwd(float val) {
 
 // Forward kernel for fused look-around flash attention
 // PARALLELIZED: Each thread handles rows m = tid, tid + num_threads, ...
+// window_left: number of tokens to the left to attend to (-1 = unlimited/full attention)
 template <int BLOCK_M, int BLOCK_N, int BLOCK_D, bool IS_CAUSAL>
 __global__ void fused_look_around_flash_fwd_kernel(
     const __nv_bfloat16* __restrict__ Q,  // (B, H, T_q, D)
@@ -59,7 +60,8 @@ __global__ void fused_look_around_flash_fwd_kernel(
     __nv_bfloat16* __restrict__ O,        // (B, H, T_q, D)
     float* __restrict__ LSE,              // (B, H, T_q) log-sum-exp for backward
     int B, int H, int T_q, int T_k, int D,
-    float sm_scale
+    float sm_scale,
+    int window_left  // -1 for full attention, >= 0 for sliding window
 ) {
     // Grid: (num_q_blocks, B * H)
     const int q_block_idx = blockIdx.x;
@@ -131,8 +133,28 @@ __global__ void fused_look_around_flash_fwd_kernel(
     }
     __syncthreads();
 
-    // Iterate over K/V blocks
-    for (int k_block_start = 0; k_block_start < T_k; k_block_start += BLOCK_N) {
+    // Compute K/V iteration bounds based on window size
+    // For queries in range [q_start, q_start + BLOCK_M), we need K in range:
+    // - Earliest: max(0, q_start - window_left - HALO_SIZE) for windowed, or 0 for full
+    // - Latest: q_start + BLOCK_M - 1 + HALO_SIZE for non-causal, or q_start + BLOCK_M - 1 for causal
+    // We round to block boundaries for efficiency
+    int k_iter_start = 0;
+    int k_iter_end = T_k;
+
+    if (window_left >= 0) {
+        // Sliding window: earliest K position needed (accounting for halo)
+        int earliest_k = max(0, q_start - window_left - HALO_SIZE);
+        k_iter_start = (earliest_k / BLOCK_N) * BLOCK_N;  // Round down to block boundary
+    }
+
+    if (IS_CAUSAL) {
+        // Causal: latest K position is last query position (+ halo for convolution)
+        int latest_k = q_start + BLOCK_M - 1 + HALO_SIZE;
+        k_iter_end = min(T_k, ((latest_k / BLOCK_N) + 1) * BLOCK_N);  // Round up to block boundary
+    }
+
+    // Iterate over K/V blocks (only within window)
+    for (int k_block_start = k_iter_start; k_block_start < k_iter_end; k_block_start += BLOCK_N) {
         // Load K with halos: positions [k_block_start - 2, k_block_start + BLOCK_N + 2)
         for (int i = tid; i < (BLOCK_N + 4) * BLOCK_D; i += num_threads) {
             int n = i / BLOCK_D;
@@ -176,6 +198,11 @@ __global__ void fused_look_around_flash_fwd_kernel(
 
                 // Apply causal mask
                 if (IS_CAUSAL && k_pos > q_pos) {
+                    sum = NEG_INF;
+                }
+
+                // Apply sliding window mask
+                if (window_left >= 0 && k_pos < q_pos - window_left) {
                     sum = NEG_INF;
                 }
 
@@ -312,6 +339,7 @@ void launch_fused_look_around_flash_fwd(
     int B, int H, int T_q, int T_k, int D,
     float sm_scale,
     bool causal,
+    int window_left,  // -1 for full attention, >= 0 for sliding window
     cudaStream_t stream
 ) {
     // Choose block sizes based on head dimension
@@ -362,13 +390,13 @@ void launch_fused_look_around_flash_fwd(
             fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 64, true>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, proj_weights, O, LSE,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         } else {
             fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 64, false>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, proj_weights, O, LSE,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         }
     } else {
@@ -395,13 +423,13 @@ void launch_fused_look_around_flash_fwd(
             fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 128, true>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, proj_weights, O, LSE,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         } else {
             fused_look_around_flash_fwd_kernel<BLOCK_M, BLOCK_N, 128, false>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, proj_weights, O, LSE,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         }
     }

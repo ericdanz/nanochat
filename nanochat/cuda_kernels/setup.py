@@ -21,7 +21,7 @@ csrc_dir = os.path.join(this_dir, 'csrc')
 # sm_120 is for RTX 5090 (Blackwell)
 # Also include sm_89 for RTX 4090, sm_80 for A100
 CUDA_ARCH_LIST = [
-    '-gencode=arch=compute_80,code=sm_80',   # A100
+    # '-gencode=arch=compute_80,code=sm_80',   # A100
     '-gencode=arch=compute_89,code=sm_89',   # RTX 4090
     '-gencode=arch=compute_120,code=sm_120', # RTX 5090 (Blackwell)
 ]

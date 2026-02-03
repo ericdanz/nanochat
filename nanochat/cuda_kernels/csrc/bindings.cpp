@@ -9,7 +9,8 @@ std::vector<torch::Tensor> fused_look_around_flash_fwd_cuda(
     torch::Tensor k,
     torch::Tensor v,
     torch::Tensor proj_weights,
-    bool causal
+    bool causal,
+    int window_left
 );
 
 std::vector<torch::Tensor> fused_look_around_flash_bwd_cuda(
@@ -20,7 +21,8 @@ std::vector<torch::Tensor> fused_look_around_flash_bwd_cuda(
     torch::Tensor out,
     torch::Tensor lse,
     torch::Tensor proj_weights,
-    bool causal
+    bool causal,
+    int window_left
 );
 
 // Python module
@@ -28,11 +30,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &fused_look_around_flash_fwd_cuda,
           "Fused look-around flash attention forward (CUDA)",
           py::arg("q"), py::arg("k"), py::arg("v"),
-          py::arg("proj_weights"), py::arg("causal") = true);
+          py::arg("proj_weights"), py::arg("causal") = true,
+          py::arg("window_left") = -1);
 
     m.def("backward", &fused_look_around_flash_bwd_cuda,
           "Fused look-around flash attention backward (CUDA)",
           py::arg("grad_out"), py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("out"), py::arg("lse"), py::arg("proj_weights"),
-          py::arg("causal") = true);
+          py::arg("causal") = true, py::arg("window_left") = -1);
 }

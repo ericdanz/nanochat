@@ -134,8 +134,10 @@ class CausalSelfAttention(nn.Module):
                 q_t = q.transpose(1, 2).contiguous()  # (B, H, T, D)
                 k_t = k.transpose(1, 2).contiguous()
                 v_t = v.transpose(1, 2).contiguous()
+                # window_size is (left, right) tuple; extract left for CUDA kernel (-1 = full attention)
+                window_left = window_size[0] if window_size is not None else -1
                 y = fused_look_around_flash_attention_cuda(
-                    q_t, k_t, v_t, self.look_around_proj, causal=True
+                    q_t, k_t, v_t, self.look_around_proj, causal=True, window_left=window_left
                 )
                 y = y.transpose(1, 2)  # Back to (B, T, H, D)
             elif self.look_around_proj is not None:

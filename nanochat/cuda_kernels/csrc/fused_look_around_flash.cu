@@ -23,7 +23,8 @@ std::vector<torch::Tensor> fused_look_around_flash_fwd_cuda(
     torch::Tensor k,           // (B, H, T_k, D) bfloat16
     torch::Tensor v,           // (B, H, T_k, D) bfloat16
     torch::Tensor proj_weights, // (H, 5) float32, pre-softmaxed
-    bool causal
+    bool causal,
+    int window_left            // -1 for full attention, >= 0 for sliding window
 ) {
     CHECK_INPUT(q);
     CHECK_INPUT(k);
@@ -68,6 +69,7 @@ std::vector<torch::Tensor> fused_look_around_flash_fwd_cuda(
         B, H, T_q, T_k, D,
         sm_scale,
         causal,
+        window_left,
         stream
     );
 
@@ -91,7 +93,8 @@ std::vector<torch::Tensor> fused_look_around_flash_bwd_cuda(
     torch::Tensor out,         // (B, H, T_q, D) bfloat16
     torch::Tensor lse,         // (B, H, T_q) float32
     torch::Tensor proj_weights, // (H, 5) float32, pre-softmaxed
-    bool causal
+    bool causal,
+    int window_left            // -1 for full attention, >= 0 for sliding window
 ) {
     CHECK_INPUT(grad_out);
     CHECK_INPUT(q);
@@ -134,6 +137,7 @@ std::vector<torch::Tensor> fused_look_around_flash_bwd_cuda(
         B, H, T_q, T_k, D,
         sm_scale,
         causal,
+        window_left,
         stream
     );
 

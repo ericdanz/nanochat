@@ -31,6 +31,7 @@ __device__ __forceinline__ __nv_bfloat16 float_to_bf16_bwd(float x) {
 
 // Backward kernel for fused look-around flash attention
 // PARALLELIZED: Each thread handles rows m = tid, tid + num_threads, ...
+// window_left: number of tokens to the left to attend to (-1 = unlimited/full attention)
 template <int BLOCK_M, int BLOCK_N, int BLOCK_D, bool IS_CAUSAL>
 __global__ void fused_look_around_flash_bwd_kernel(
     // Inputs from forward
@@ -47,7 +48,8 @@ __global__ void fused_look_around_flash_bwd_kernel(
     float* __restrict__ dV,               // (B, H, T_k, D) - float for atomic add
     float* __restrict__ dProj_weights,    // (H, 5)
     int B, int H, int T_q, int T_k, int D,
-    float sm_scale
+    float sm_scale,
+    int window_left  // -1 for full attention, >= 0 for sliding window
 ) {
     // Grid: (num_q_blocks, B * H)
     const int q_block_idx = blockIdx.x;
@@ -151,8 +153,24 @@ __global__ void fused_look_around_flash_bwd_kernel(
     }
     __syncthreads();
 
-    // Iterate over K/V blocks
-    for (int k_block_start = 0; k_block_start < T_k; k_block_start += BLOCK_N) {
+    // Compute K/V iteration bounds based on window size (same logic as forward)
+    int k_iter_start = 0;
+    int k_iter_end = T_k;
+
+    if (window_left >= 0) {
+        // Sliding window: earliest K position needed (accounting for halo)
+        int earliest_k = max(0, q_start - window_left - 2);  // HALO_SIZE = 2
+        k_iter_start = (earliest_k / BLOCK_N) * BLOCK_N;  // Round down to block boundary
+    }
+
+    if (IS_CAUSAL) {
+        // Causal: latest K position is last query position (+ halo for convolution)
+        int latest_k = q_start + BLOCK_M - 1 + 2;  // HALO_SIZE = 2
+        k_iter_end = min(T_k, ((latest_k / BLOCK_N) + 1) * BLOCK_N);  // Round up to block boundary
+    }
+
+    // Iterate over K/V blocks (only within window)
+    for (int k_block_start = k_iter_start; k_block_start < k_iter_end; k_block_start += BLOCK_N) {
         // Load K with halos - PARALLELIZED
         for (int i = tid; i < (BLOCK_N + 4) * BLOCK_D; i += num_threads) {
             int n = i / BLOCK_D;
@@ -197,6 +215,12 @@ __global__ void fused_look_around_flash_bwd_kernel(
                 if (IS_CAUSAL && k_pos > q_pos) {
                     sum = NEG_INF_BWD;
                 }
+
+                // Apply sliding window mask
+                if (window_left >= 0 && k_pos < q_pos - window_left) {
+                    sum = NEG_INF_BWD;
+                }
+
                 S_smem[m * (BLOCK_N + 4) + n_halo] = sum;
             } else {
                 S_smem[m * (BLOCK_N + 4) + n_halo] = NEG_INF_BWD;
@@ -384,25 +408,26 @@ void launch_fused_look_around_flash_bwd(
     int B, int H, int T_q, int T_k, int D,
     float sm_scale,
     bool causal,
+    int window_left,  // -1 for full attention, >= 0 for sliding window
     cudaStream_t stream
 ) {
-    constexpr int BLOCK_M = 64;
-    constexpr int BLOCK_N = 64;
-
-    int num_q_blocks = (T_q + BLOCK_M - 1) / BLOCK_M;
-    dim3 grid(num_q_blocks, B * H);
-    dim3 block(128);
-
-    // Shared memory size
-    size_t smem_size = 0;
-
     // Get device properties for shared memory configuration
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp props;
     cudaGetDeviceProperties(&props, device);
 
+    // Shared memory size
+    size_t smem_size = 0;
+
     if (D <= 64) {
+        constexpr int BLOCK_M = 64;
+        constexpr int BLOCK_N = 64;
+
+        int num_q_blocks = (T_q + BLOCK_M - 1) / BLOCK_M;
+        dim3 grid(num_q_blocks, B * H);
+        dim3 block(128);
+
         // Q_smem + dO_smem + O_smem + LSE_smem + D_i_smem + K_smem + V_smem + S_smem + dQ_smem + dw_accum
         smem_size = BLOCK_M * 64 * 2 * 3 +       // Q, dO, O (bf16)
                     BLOCK_M * 4 * 2 +             // LSE, D_i (float)
@@ -428,25 +453,36 @@ void launch_fused_look_around_flash_bwd(
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, O, LSE, proj_weights, dO,
                     dQ, dK, dV, dProj_weights,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         } else {
             fused_look_around_flash_bwd_kernel<BLOCK_M, BLOCK_N, 64, false>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, O, LSE, proj_weights, dO,
                     dQ, dK, dV, dProj_weights,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         }
     } else {
-        smem_size = BLOCK_M * 128 * 2 * 3 +
-                    BLOCK_M * 4 * 2 +
-                    (BLOCK_N + 4) * 128 * 2 +
-                    BLOCK_N * 128 * 2 +
-                    BLOCK_M * (BLOCK_N + 4) * 4 +
-                    BLOCK_M * 128 * 4 +
-                    5 * 4 +
-                    5 * 4;
+        // For D > 64, use smaller BLOCK_M to fit in shared memory
+        // RTX 5090 has 99KB max shared memory per block
+        // With BLOCK_M=32, BLOCK_N=32: ~63KB which fits
+        constexpr int BLOCK_M = 32;
+        constexpr int BLOCK_N = 32;
+
+        int num_q_blocks = (T_q + BLOCK_M - 1) / BLOCK_M;
+        dim3 grid(num_q_blocks, B * H);
+        dim3 block(128);
+
+        smem_size = BLOCK_M * 128 * 2 * 3 +      // Q, dO, O (bf16): 24576
+                    BLOCK_M * 4 * 2 +             // LSE, D_i (float): 256
+                    (BLOCK_N + 4) * 128 * 2 +    // K with halos (bf16): 9216
+                    BLOCK_N * 128 * 2 +          // V (bf16): 8192
+                    BLOCK_M * (BLOCK_N + 4) * 4 + // S (float): 4608
+                    BLOCK_M * 128 * 4 +          // dQ (float): 16384
+                    5 * 4 +                       // w_shared
+                    5 * 4;                        // dw_accum
+        // Total: ~63KB
 
         // Set max dynamic shared memory if needed
         if (smem_size > props.sharedMemPerBlock) {
@@ -463,14 +499,14 @@ void launch_fused_look_around_flash_bwd(
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, O, LSE, proj_weights, dO,
                     dQ, dK, dV, dProj_weights,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         } else {
             fused_look_around_flash_bwd_kernel<BLOCK_M, BLOCK_N, 128, false>
                 <<<grid, block, smem_size, stream>>>(
                     Q, K, V, O, LSE, proj_weights, dO,
                     dQ, dK, dV, dProj_weights,
-                    B, H, T_q, T_k, D, sm_scale
+                    B, H, T_q, T_k, D, sm_scale, window_left
                 );
         }
     }
