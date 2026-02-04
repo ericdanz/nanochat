@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    rotation_max_eps: float = 0.1  # max rotation angle for regularizer (0 = disabled)
 
 
 def norm(x):
@@ -55,6 +56,43 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+class RotationRegularizer(nn.Module):
+    """Per-head random rotation regularizer. Only active during training."""
+
+    def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.max_eps = max_eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.max_eps == 0:
+            return x
+
+        shape = x.shape  # (B, T, dim)
+        x = x.view(-1, self.num_heads, self.head_dim)  # (B*T, num_heads, head_dim)
+
+        # Random eps uniform in [-max_eps, max_eps] per head
+        eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
+        tan_eps = torch.tan(eps)  # (num_heads,)
+
+        # Random orthogonal direction vectors (re-init each forward)
+        # orthogonal_ requires float32, so init in fp32 then cast
+        directions = torch.empty(self.num_heads, self.head_dim, device=x.device, dtype=torch.float32)
+        nn.init.orthogonal_(directions)
+        directions = F.normalize(directions, dim=-1).to(x.dtype)  # (num_heads, head_dim)
+
+        # Per-head rotation preserving norm
+        head_norms = x.norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
+        scaled_dirs = directions * head_norms * tan_eps.unsqueeze(0).unsqueeze(-1)  # (B*T, num_heads, head_dim)
+
+        rotated = x + scaled_dirs
+        rotated = F.normalize(rotated, dim=-1, eps=1e-6) * head_norms
+
+        return rotated.view(shape)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -123,11 +161,14 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if config.rotation_max_eps > 0 else None
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
+        if self.rotation is not None:
+            x = self.rotation(x)
         return x
 
 
