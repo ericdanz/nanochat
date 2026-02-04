@@ -452,18 +452,22 @@ __global__ void fused_look_around_flash_fwd_kernel_wmma(
     const float w3 = w_shared[3];  // Weight for shift -1
     const float w4 = w_shared[4];  // Weight for shift -2
 
-    // Shared memory layout (WMMA version):
+    // Shared memory layout (WMMA version with P@V):
     // - Q_smem: (BLOCK_M, BLOCK_D) for query block
     // - K_smem: (BLOCK_N + K_HALO_PADDED, BLOCK_D) for key block with padded halos
     // - V_smem: (BLOCK_N, BLOCK_D) for value block
     // - S_smem: (BLOCK_M, BLOCK_N + K_HALO_PADDED) for QK scores with padded halos
+    // - P_smem: (BLOCK_M, BLOCK_N) for convolved attention weights (bf16 for WMMA P@V)
+    // - O_block_smem: (BLOCK_M, BLOCK_D) for WMMA P@V output (float)
     // - m_smem, l_smem, acc_smem: per-query accumulators
     extern __shared__ char smem[];
     __nv_bfloat16* Q_smem = reinterpret_cast<__nv_bfloat16*>(smem);
     __nv_bfloat16* K_smem = Q_smem + BLOCK_M * BLOCK_D;
     __nv_bfloat16* V_smem = K_smem + (BLOCK_N + K_HALO_PADDED) * BLOCK_D;
     float* S_smem = reinterpret_cast<float*>(V_smem + BLOCK_N * BLOCK_D);
-    float* m_smem = S_smem + BLOCK_M * S_STRIDE;  // Running max per query
+    __nv_bfloat16* P_smem = reinterpret_cast<__nv_bfloat16*>(S_smem + BLOCK_M * S_STRIDE);
+    float* O_block_smem = reinterpret_cast<float*>(P_smem + BLOCK_M * BLOCK_N);
+    float* m_smem = O_block_smem + BLOCK_M * BLOCK_D;
     float* l_smem = m_smem + BLOCK_M;             // Running sum per query
     float* acc_smem = l_smem + BLOCK_M;           // Output accumulator (BLOCK_M, D)
 
@@ -605,58 +609,51 @@ __global__ void fused_look_around_flash_fwd_kernel_wmma(
         __syncthreads();
 
         // ============================================================
-        // MAIN FORWARD COMPUTATION - PARALLELIZED OVER M
-        // Each warp handles different rows for better parallelism
+        // PHASE 1: Find max and compute P matrix for this K block
         // ============================================================
+
+        // Shared memory for per-row max and sum for this block
+        __shared__ float m_block[BLOCK_M];  // Max for this K block
+        __shared__ float l_block[BLOCK_M];  // Sum for this K block
+
+        // First pass: find max over all 5 shifted scores for each query
         #pragma unroll 1
         for (int m = tid; m < BLOCK_M; m += num_threads) {
             int q_pos = q_start + m;
-            if (q_pos >= T_q) continue;
-
-            float m_i = m_smem[m];
-            float l_i = l_smem[m];
-
-            // Find max over all 5 shifted QK arrays for this K block
-            // Access pattern adjusted for padded layout
             float m_ij = NEG_INF;
 
-            #pragma unroll 4
-            for (int n = 0; n < BLOCK_N; n++) {
-                int v_pos = k_block_start + n;
-                if (v_pos >= T_k) continue;
+            if (q_pos < T_q) {
+                #pragma unroll 4
+                for (int n = 0; n < BLOCK_N; n++) {
+                    int v_pos = k_block_start + n;
+                    if (v_pos >= T_k) continue;
 
-                // Access scores at S_OFFSET (=6) to get the valid halo region
-                float s_m2 = S_smem[m * S_STRIDE + n + S_OFFSET + 0];
-                float s_m1 = S_smem[m * S_STRIDE + n + S_OFFSET + 1];
-                float s_0  = S_smem[m * S_STRIDE + n + S_OFFSET + 2];
-                float s_p1 = S_smem[m * S_STRIDE + n + S_OFFSET + 3];
-                float s_p2 = S_smem[m * S_STRIDE + n + S_OFFSET + 4];
+                    float s_m2 = S_smem[m * S_STRIDE + n + S_OFFSET + 0];
+                    float s_m1 = S_smem[m * S_STRIDE + n + S_OFFSET + 1];
+                    float s_0  = S_smem[m * S_STRIDE + n + S_OFFSET + 2];
+                    float s_p1 = S_smem[m * S_STRIDE + n + S_OFFSET + 3];
+                    float s_p2 = S_smem[m * S_STRIDE + n + S_OFFSET + 4];
 
-                m_ij = fmaxf(m_ij, fmaxf(fmaxf(s_m2, s_m1), fmaxf(fmaxf(s_0, s_p1), s_p2)));
+                    m_ij = fmaxf(m_ij, fmaxf(fmaxf(s_m2, s_m1), fmaxf(fmaxf(s_0, s_p1), s_p2)));
+                }
             }
+            m_block[m] = m_ij;
+        }
+        __syncthreads();
 
-            // Update running max
-            float m_new = fmaxf(m_i, m_ij);
-            float alpha = expf(m_i - m_new);
+        // Second pass: compute p_conv values, store in P_smem (bf16), compute row sums
+        #pragma unroll 1
+        for (int i = tid; i < BLOCK_M * BLOCK_N; i += num_threads) {
+            int m = i / BLOCK_N;
+            int n = i % BLOCK_N;
+            int q_pos = q_start + m;
+            int v_pos = k_block_start + n;
 
-            // Rescale previous accumulator
-            l_i *= alpha;
-            float* acc_row = acc_smem + m * D;
+            float p_conv = 0.0f;
 
-            #pragma unroll 8
-            for (int d = 0; d < D; d++) {
-                acc_row[d] *= alpha;
-            }
+            if (q_pos < T_q && v_pos < T_k) {
+                float m_new = fmaxf(m_smem[m], m_block[m]);
 
-            // Accumulate for this K block
-            float l_ij = 0.0f;
-
-            #pragma unroll 2
-            for (int n = 0; n < BLOCK_N; n++) {
-                int v_pos = k_block_start + n;
-                if (v_pos >= T_k) continue;
-
-                // Get exp(QK - m_new) for all 5 shifts with S_OFFSET
                 float s_m2 = S_smem[m * S_STRIDE + n + S_OFFSET + 0];
                 float s_m1 = S_smem[m * S_STRIDE + n + S_OFFSET + 1];
                 float s_0  = S_smem[m * S_STRIDE + n + S_OFFSET + 2];
@@ -670,28 +667,113 @@ __global__ void fused_look_around_flash_fwd_kernel_wmma(
                 float p_p2 = (s_p2 > -1e20f) ? expf(s_p2 - m_new) : 0.0f;
 
                 // 5-tap convolution
-                float p_conv = w0 * p_p2 + w1 * p_p1 + w2 * p_0 + w3 * p_m1 + w4 * p_m2;
+                p_conv = w0 * p_p2 + w1 * p_p1 + w2 * p_0 + w3 * p_m1 + w4 * p_m2;
 
                 // Re-apply causal mask after convolution
                 if (IS_CAUSAL && v_pos > q_pos) {
                     p_conv = 0.0f;
                 }
+            }
 
-                l_ij += p_conv;
+            // Store in P_smem as bf16 for WMMA
+            P_smem[m * BLOCK_N + n] = float_to_bf16(p_conv);
+        }
+        __syncthreads();
 
-                // Accumulate output: acc += p_conv * V[n]
-                if (p_conv > 0.0f) {
-                    const __nv_bfloat16* v_row = V_smem + n * BLOCK_D;
-                    #pragma unroll 8
-                    for (int d = 0; d < D; d++) {
-                        acc_row[d] += p_conv * bf16_to_float(v_row[d]);
-                    }
-                }
+        // Compute row sums (l_block) for normalization tracking
+        #pragma unroll 1
+        for (int m = tid; m < BLOCK_M; m += num_threads) {
+            float l_ij = 0.0f;
+            #pragma unroll 4
+            for (int n = 0; n < BLOCK_N; n++) {
+                l_ij += bf16_to_float(P_smem[m * BLOCK_N + n]);
+            }
+            l_block[m] = l_ij;
+        }
+        __syncthreads();
+
+        // ============================================================
+        // PHASE 2: Rescale accumulator and update running state
+        // ============================================================
+        #pragma unroll 1
+        for (int m = tid; m < BLOCK_M; m += num_threads) {
+            int q_pos = q_start + m;
+            if (q_pos >= T_q) continue;
+
+            float m_i = m_smem[m];
+            float l_i = l_smem[m];
+            float m_new = fmaxf(m_i, m_block[m]);
+            float alpha = expf(m_i - m_new);
+
+            // Rescale previous accumulator
+            float* acc_row = acc_smem + m * D;
+            #pragma unroll 8
+            for (int d = 0; d < D; d++) {
+                acc_row[d] *= alpha;
             }
 
             // Update running state
-            l_smem[m] = l_i + l_ij;
             m_smem[m] = m_new;
+            l_smem[m] = l_i * alpha + l_block[m];
+        }
+        __syncthreads();
+
+        // ============================================================
+        // PHASE 3: WMMA P @ V computation
+        // P is (BLOCK_M, BLOCK_N) row-major bf16
+        // V is (BLOCK_N, D) row-major bf16
+        // Output is (BLOCK_M, D) stored in O_block_smem, then added to acc_smem
+        // ============================================================
+
+        // Zero out O_block_smem before WMMA
+        #pragma unroll 4
+        for (int i = tid; i < BLOCK_M * BLOCK_D; i += num_threads) {
+            O_block_smem[i] = 0.0f;
+        }
+        __syncthreads();
+
+        // WMMA tile counts for P @ V
+        constexpr int PV_M_TILES = BLOCK_M / WMMA_M;  // 4
+        constexpr int PV_N_TILES = BLOCK_D / WMMA_N;  // 4 for D=64
+        constexpr int PV_K_TILES = BLOCK_N / WMMA_K;  // 4
+
+        // Each warp computes multiple output tiles
+        for (int tile_idx = warp_id; tile_idx < PV_M_TILES * PV_N_TILES; tile_idx += num_warps) {
+            int m_tile = tile_idx / PV_N_TILES;
+            int n_tile = tile_idx % PV_N_TILES;
+
+            // WMMA fragments for P @ V
+            fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> p_frag;
+            fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> v_frag;
+            fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> o_frag;
+
+            fill_fragment(o_frag, 0.0f);
+
+            // Accumulate over K (BLOCK_N) dimension
+            #pragma unroll
+            for (int k_tile = 0; k_tile < PV_K_TILES; k_tile++) {
+                // Load P tile: P_smem[m_tile*16 : m_tile*16+16, k_tile*16 : k_tile*16+16]
+                load_matrix_sync(p_frag, P_smem + m_tile * WMMA_M * BLOCK_N + k_tile * WMMA_K, BLOCK_N);
+
+                // Load V tile: V_smem[k_tile*16 : k_tile*16+16, n_tile*16 : n_tile*16+16]
+                load_matrix_sync(v_frag, V_smem + k_tile * WMMA_K * BLOCK_D + n_tile * WMMA_N, BLOCK_D);
+
+                // Compute O += P @ V
+                mma_sync(o_frag, p_frag, v_frag, o_frag);
+            }
+
+            // Store WMMA result to O_block_smem using store_matrix_sync
+            store_matrix_sync(O_block_smem + m_tile * WMMA_M * BLOCK_D + n_tile * WMMA_N,
+                              o_frag, BLOCK_D, mem_row_major);
+        }
+        __syncthreads();
+
+        // Add O_block_smem to acc_smem (note: O_block_smem has stride BLOCK_D, acc_smem has stride D)
+        #pragma unroll 4
+        for (int i = tid; i < BLOCK_M * D; i += num_threads) {
+            int m = i / D;
+            int d = i % D;
+            acc_smem[m * D + d] += O_block_smem[m * BLOCK_D + d];
         }
         __syncthreads();
     }
@@ -768,14 +850,18 @@ void launch_fused_look_around_flash_fwd(
                     BLOCK_M * 64 * 4 +           // acc_smem
                     5 * 4;                        // w_shared
 
-        // WMMA kernel shared memory (padded halo = 16)
+        // WMMA kernel shared memory (padded halo = 16, includes P_smem and O_block_smem for WMMA P@V)
         smem_size_wmma = BLOCK_M * 64 * 2 +           // Q_smem
                          (BLOCK_N + K_HALO_PADDED) * 64 * 2 +     // K_smem (80 * 64 * 2)
                          BLOCK_N * 64 * 2 +           // V_smem
                          BLOCK_M * (BLOCK_N + K_HALO_PADDED) * 4 + // S_smem (64 * 80 * 4)
+                         BLOCK_M * BLOCK_N * 2 +      // P_smem (64 * 64 * 2) for WMMA P@V
+                         BLOCK_M * 64 * 4 +           // O_block_smem (64 * 64 * 4)
                          BLOCK_M * 4 +                 // m_smem
                          BLOCK_M * 4 +                 // l_smem
                          BLOCK_M * 64 * 4 +           // acc_smem
+                         BLOCK_M * 4 +                 // m_block (local)
+                         BLOCK_M * 4 +                 // l_block (local)
                          5 * 4;                        // w_shared
 
         if (use_wmma) {
@@ -835,14 +921,18 @@ void launch_fused_look_around_flash_fwd(
                     BLOCK_M * 128 * 4 +          // acc_smem
                     5 * 4;                        // w_shared
 
-        // WMMA kernel shared memory (padded halo = 16)
+        // WMMA kernel shared memory (padded halo = 16, includes P_smem and O_block_smem for WMMA P@V)
         smem_size_wmma = BLOCK_M * 128 * 2 +          // Q_smem
                          (BLOCK_N + K_HALO_PADDED) * 128 * 2 +    // K_smem
                          BLOCK_N * 128 * 2 +          // V_smem
                          BLOCK_M * (BLOCK_N + K_HALO_PADDED) * 4 + // S_smem
+                         BLOCK_M * BLOCK_N * 2 +      // P_smem for WMMA P@V
+                         BLOCK_M * 128 * 4 +          // O_block_smem
                          BLOCK_M * 4 +                 // m_smem
                          BLOCK_M * 4 +                 // l_smem
                          BLOCK_M * 128 * 4 +          // acc_smem
+                         BLOCK_M * 4 +                 // m_block (local)
+                         BLOCK_M * 4 +                 // l_block (local)
                          5 * 4;                        // w_shared
 
         if (use_wmma) {
