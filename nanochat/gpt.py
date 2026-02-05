@@ -61,10 +61,10 @@ def apply_rotary_emb(x, cos, sin):
 class RotationRegularizer(nn.Module):
     """Per-head random rotation regularizer. Only active during training.
 
-    Pre-computes 2000 * num_heads orthogonal direction vectors at init time,
-    then cycles through them sequentially during training.
+    Pre-computes NUM_PRECOMPUTED * num_heads orthogonal direction vectors at init,
+    then cycles through them sequentially during training to avoid recomputation.
     """
-    NUM_PRECOMPUTED = 1000  # number of direction sets to pre-compute
+    NUM_PRECOMPUTED = 1000
 
     def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
         super().__init__()
