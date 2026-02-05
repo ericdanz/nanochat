@@ -71,7 +71,8 @@ class RotationRegularizer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.max_eps = max_eps
-        self.direction_idx = 0  # current index into pre-computed directions
+        # Register direction_idx as tensor buffer for torch.compile compatibility
+        self.register_buffer('direction_idx', torch.tensor(0, dtype=torch.long), persistent=False)
         # Pre-compute orthogonal directions (actual init happens in init_directions)
         # Shape: (NUM_PRECOMPUTED * num_heads, head_dim)
         self.register_buffer('directions', torch.zeros(self.NUM_PRECOMPUTED * num_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
@@ -100,27 +101,34 @@ class RotationRegularizer(nn.Module):
         shape = x.shape  # (B, T, dim)
         x = x.view(-1, self.num_heads, self.head_dim)  # (B*T, num_heads, head_dim)
 
-        # Random eps uniform in [-max_eps, max_eps] per head
-        eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
-        tan_eps = torch.tan(eps)  # (num_heads,)
+        # Compute perturbation under no_grad - we only need gradients through x, not the rotation
+        with torch.no_grad():
+            # Random eps uniform in [-max_eps, max_eps] per head
+            eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
+            tan_eps = torch.tan(eps)  # (num_heads,)
 
-        # Get pre-computed orthogonal directions for this forward pass
-        # Indices: [idx, idx+1, ..., idx+num_heads-1] with wraparound
-        total_dirs = self.NUM_PRECOMPUTED * self.num_heads
-        indices = [(self.direction_idx + i) % total_dirs for i in range(self.num_heads)]
-        directions = self.directions[indices]  # (num_heads, head_dim)
+            # Get pre-computed orthogonal directions for this forward pass
+            # Use tensor ops for torch.compile compatibility (avoids recompilation)
+            total_dirs = self.NUM_PRECOMPUTED * self.num_heads
+            indices = (self.direction_idx + torch.arange(self.num_heads, device=x.device)) % total_dirs
+            directions = self.directions[indices]  # (num_heads, head_dim)
 
-        # Advance index for next forward pass (wrap around)
-        self.direction_idx = (self.direction_idx + self.num_heads) % total_dirs
+            # Advance index for next forward pass (in-place tensor op for torch.compile)
+            self.direction_idx.add_(self.num_heads).fmod_(total_dirs)
 
-        # Per-head rotation preserving norm
-        head_norms = x.norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
-        scaled_dirs = directions * head_norms * tan_eps.unsqueeze(0).unsqueeze(-1)  # (B*T, num_heads, head_dim)
+            # Compute perturbation (all inputs are detached/random, no grad needed)
+            head_norms = x.detach().norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
+            perturbation = directions * head_norms * tan_eps.unsqueeze(0).unsqueeze(-1)
 
-        rotated = x + scaled_dirs
-        rotated = F.normalize(rotated, dim=-1, eps=1e-6) * head_norms
+        # Apply perturbation - gradient flows through x
+        rotated = x + perturbation
 
-        return rotated.view(shape)
+        # Renormalize to preserve original norms (scale is detached)
+        with torch.no_grad():
+            output_norms = rotated.detach().norm(dim=-1, keepdim=True) + 1e-6
+            scale = head_norms / output_norms
+
+        return (rotated * scale).view(shape)
 
 
 class CausalSelfAttention(nn.Module):
@@ -186,11 +194,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if config.rotation_max_eps > 0 else None
+        # Rotation regularizer only on even layers to save memory
+        use_rotation = config.rotation_max_eps > 0 and layer_idx % 2 == 0
+        self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if use_rotation else None
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -205,7 +215,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
