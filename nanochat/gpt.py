@@ -59,13 +59,39 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class RotationRegularizer(nn.Module):
-    """Per-head random rotation regularizer. Only active during training."""
+    """Per-head random rotation regularizer. Only active during training.
+
+    Pre-computes 2000 * num_heads orthogonal direction vectors at init time,
+    then cycles through them sequentially during training.
+    """
+    NUM_PRECOMPUTED = 1000  # number of direction sets to pre-compute
 
     def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.max_eps = max_eps
+        self.direction_idx = 0  # current index into pre-computed directions
+        # Pre-compute orthogonal directions (actual init happens in init_directions)
+        # Shape: (NUM_PRECOMPUTED * num_heads, head_dim)
+        self.register_buffer('directions', torch.zeros(self.NUM_PRECOMPUTED * num_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
+
+    @torch.no_grad()
+    def init_directions(self):
+        """Initialize orthogonal direction vectors. Called after model is on device."""
+        device = self.directions.device
+        dtype = self.directions.dtype
+        # Generate orthogonal matrices and write rows directly to buffer (memory efficient)
+        # Each orthogonal matrix gives us head_dim orthonormal vectors
+        total_needed = self.NUM_PRECOMPUTED * self.num_heads
+        idx = 0
+        while idx < total_needed:
+            # Generate orthogonal matrix on CPU to save GPU memory, then copy rows
+            Q = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim, dtype=torch.float32))[0]
+            # Copy rows directly to buffer
+            rows_to_copy = min(self.head_dim, total_needed - idx)
+            self.directions[idx:idx + rows_to_copy] = Q[:rows_to_copy].to(device=device, dtype=dtype)
+            idx += rows_to_copy
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.max_eps == 0:
@@ -78,11 +104,14 @@ class RotationRegularizer(nn.Module):
         eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
         tan_eps = torch.tan(eps)  # (num_heads,)
 
-        # Random orthogonal direction vectors (re-init each forward)
-        # orthogonal_ requires float32, so init in fp32 then cast
-        directions = torch.empty(self.num_heads, self.head_dim, device=x.device, dtype=torch.float32)
-        nn.init.orthogonal_(directions)
-        directions = F.normalize(directions, dim=-1).to(x.dtype)  # (num_heads, head_dim)
+        # Get pre-computed orthogonal directions for this forward pass
+        # Indices: [idx, idx+1, ..., idx+num_heads-1] with wraparound
+        total_dirs = self.NUM_PRECOMPUTED * self.num_heads
+        indices = [(self.direction_idx + i) % total_dirs for i in range(self.num_heads)]
+        directions = self.directions[indices]  # (num_heads, head_dim)
+
+        # Advance index for next forward pass (wrap around)
+        self.direction_idx = (self.direction_idx + self.num_heads) % total_dirs
 
         # Per-head rotation preserving norm
         head_norms = x.norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
@@ -274,6 +303,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+
+        # Initialize rotation regularizer directions (orthogonal pre-computed)
+        for block in self.transformer.h:
+            if block.mlp.rotation is not None:
+                block.mlp.rotation.init_directions()
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
