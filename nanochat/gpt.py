@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    rotation_max_eps: float = 0.1  # max rotation angle for regularizer (0 = disabled)
 
 
 def norm(x):
@@ -55,6 +56,80 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+
+class RotationRegularizer(nn.Module):
+    """Per-head random rotation regularizer. Only active during training.
+
+    Pre-computes NUM_PRECOMPUTED * num_heads orthogonal direction vectors at init,
+    then cycles through them sequentially during training to avoid recomputation.
+    """
+    NUM_PRECOMPUTED = 1000
+
+    def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.max_eps = max_eps
+        # Register direction_idx as tensor buffer for torch.compile compatibility
+        self.register_buffer('direction_idx', torch.tensor(0, dtype=torch.long), persistent=False)
+        # Pre-compute orthogonal directions (actual init happens in init_directions)
+        # Shape: (NUM_PRECOMPUTED * num_heads, head_dim)
+        self.register_buffer('directions', torch.zeros(self.NUM_PRECOMPUTED * num_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
+
+    @torch.no_grad()
+    def init_directions(self):
+        """Initialize orthogonal direction vectors. Called after model is on device."""
+        device = self.directions.device
+        dtype = self.directions.dtype
+        # Generate orthogonal matrices and write rows directly to buffer (memory efficient)
+        # Each orthogonal matrix gives us head_dim orthonormal vectors
+        total_needed = self.NUM_PRECOMPUTED * self.num_heads
+        idx = 0
+        while idx < total_needed:
+            # Generate orthogonal matrix on CPU to save GPU memory, then copy rows
+            Q = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim, dtype=torch.float32))[0]
+            # Copy rows directly to buffer
+            rows_to_copy = min(self.head_dim, total_needed - idx)
+            self.directions[idx:idx + rows_to_copy] = Q[:rows_to_copy].to(device=device, dtype=dtype)
+            idx += rows_to_copy
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.max_eps == 0:
+            return x
+
+        shape = x.shape  # (B, T, dim)
+        x = x.view(-1, self.num_heads, self.head_dim)  # (B*T, num_heads, head_dim)
+
+        # Compute perturbation under no_grad - we only need gradients through x, not the rotation
+        with torch.no_grad():
+            # Random eps uniform in [-max_eps, max_eps] per head
+            eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
+            tan_eps = torch.tan(eps)  # (num_heads,)
+
+            # Get pre-computed orthogonal directions for this forward pass
+            # Use tensor ops for torch.compile compatibility (avoids recompilation)
+            total_dirs = self.NUM_PRECOMPUTED * self.num_heads
+            indices = (self.direction_idx + torch.arange(self.num_heads, device=x.device)) % total_dirs
+            directions = self.directions[indices]  # (num_heads, head_dim)
+
+            # Advance index for next forward pass (in-place tensor op for torch.compile)
+            self.direction_idx.add_(self.num_heads).fmod_(total_dirs)
+
+            # Compute perturbation (all inputs are detached/random, no grad needed)
+            head_norms = x.detach().norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
+            perturbation = directions * head_norms * tan_eps.unsqueeze(0).unsqueeze(-1)
+
+        # Apply perturbation - gradient flows through x
+        rotated = x + perturbation
+
+        # Renormalize to preserve original norms (scale is detached)
+        with torch.no_grad():
+            output_norms = rotated.detach().norm(dim=-1, keepdim=True) + 1e-6
+            scale = head_norms / output_norms
+
+        return (rotated * scale).view(shape)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -119,15 +194,20 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # Rotation regularizer only on even layers to save memory
+        use_rotation = config.rotation_max_eps > 0 and layer_idx % 2 == 0
+        self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if use_rotation else None
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
+        if self.rotation is not None:
+            x = self.rotation(x)
         return x
 
 
@@ -135,7 +215,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, layer_idx)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -233,6 +313,11 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+
+        # Initialize rotation regularizer directions (orthogonal pre-computed)
+        for block in self.transformer.h:
+            if block.mlp.rotation is not None:
+                block.mlp.rotation.init_directions()
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
