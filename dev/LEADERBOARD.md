@@ -89,7 +89,7 @@ Detailed writeup: [Beating GPT-2 for <<$100: the nanochat journey](https://githu
 
 ## Run 2
 
-Achieved Feb 2 2026 on commit `8309b83`. The launch command was
+Achieved Feb 2 2026 on commit `a67eba3`. The launch command was
 
 ```
 OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
@@ -117,3 +117,33 @@ Minimum validation bpb: 0.745036
 The big change in this run is `--fp8`, which causes all Linear layers (other than the gates) to be switched to fp8 training using `torchao` with tensorwise fp8 scaling. Each step is of slightly lower quality, but we are taking them a lot faster, coming out net ahead. Anyone who does not have fp8 (e.g. using a GPU without it) can simply leave out the `--fp8` flag to train in bfloat16. This will work just fine but it will produce a slightly stronger model than GPT-2 because of the fp8 -> bf16 precision upgrade. It's possible that one can further tune which layers to include in the fp8 conversion and that e.g. some of the smaller matmuls should be just kept in bf16 etc.
 
 Previous record was 3.04 hours, so 2.91 hours is `(3.04 - 2.91)/3.04*100` ~= 4.3% speed improvement.
+
+## Run 3
+
+Achieved Feb 5 2026 on commit `2c062aa`. Launch command:
+
+```
+OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
+    --depth=26 \
+    --run="d26_feb4_double_batch_ratio8.25" \
+    --model-tag="d26_feb4_double_batch_ratio8.25" \
+    --device-batch-size=16 \
+    --total-batch-size=1048576 \
+    --sample-every=-1 \
+    --save-every=-1 \
+    --core-metric-max-per-task=-1 \
+    --core-metric-every=999999 \
+    --target-param-data-ratio=8.25 \
+    --fp8
+```
+
+Result:
+
+```
+core_metric 0.26024
+step 7226
+total_training_time 9922
+Minimum validation bpb: 0.74645
+```
+
+The big change here is that the batch size was doubled from 0.5M to 1M, which works better for a d26 model and allowed me to decrease the number of optimization steps a bit via `--target-param-data-ratio` from 8.5 to 8.25. The TLDR is that the original batch size of 0.5M was tuned for d12, but bigger models (e.g. d26) prefer larger total batch size. I determined in experiments that d26 prefers 1M. Then I implemented and merged a principled way to calculate the optimal batch size given depth so that all nanochat models of all depths benefit. See [dev/LOG.md](dev/LOG.md) entry "2026-02-05: Auto Batch Size Scaling" for more detail.
