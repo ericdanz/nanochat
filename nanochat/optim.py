@@ -67,6 +67,10 @@ Polar Express Sign Method for orthogonalization.
 https://arxiv.org/pdf/2505.16932
 by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
 
+NorMuon variance reduction: per-neuron/column adaptive learning rate that normalizes
+update scales after orthogonalization (Muon's output has non-uniform scales across neurons).
+https://arxiv.org/pdf/2510.05491
+
 Some of the changes in nanochat implementation:
 - Uses a simpler, more general approach to parameter grouping and stacking
 - Uses a single fused kernel for the momentum -> polar_express -> variance_reduction -> update step
