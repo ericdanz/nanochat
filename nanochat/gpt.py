@@ -64,7 +64,7 @@ class RotationRegularizer(nn.Module):
     Stateless: randomly samples pre-computed orthogonal directions each forward pass.
     Directions stored as (NUM_PRECOMPUTED, num_heads, head_dim) for contiguous slicing.
     """
-    NUM_PRECOMPUTED = 1000
+    NUM_PRECOMPUTED = 2000
 
     def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
         super().__init__()
