@@ -11,3 +11,9 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# FA3 build artifacts
+csrc/flash_attn_3/build/
+csrc/flash_attn_3/*.egg-info/
+csrc/flash_attn_3/flash_attn_config.py
+*.so

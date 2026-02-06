@@ -26,15 +26,11 @@ def _load_flash_attention_3():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are compiled for Hopper (sm90) only
-        # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
         if major != 9:
             return None
-        import os
-        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-        from kernels import get_kernel
-        return get_kernel('varunneal/flash-attention-3').flash_attn_interface
-    except Exception:
+        import flash_attn_3.flash_attn_interface as fa3
+        return fa3
+    except ImportError:
         return None
 
 
