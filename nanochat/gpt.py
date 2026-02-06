@@ -61,8 +61,8 @@ def apply_rotary_emb(x, cos, sin):
 class RotationRegularizer(nn.Module):
     """Per-head random rotation regularizer. Only active during training.
 
-    Pre-computes NUM_PRECOMPUTED * num_heads orthogonal direction vectors at init,
-    then cycles through them sequentially during training to avoid recomputation.
+    Stateless: randomly samples pre-computed orthogonal directions each forward pass.
+    Directions stored as (NUM_PRECOMPUTED, num_heads, head_dim) for contiguous slicing.
     """
     NUM_PRECOMPUTED = 1000
 
@@ -71,64 +71,45 @@ class RotationRegularizer(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.max_eps = max_eps
-        # Register direction_idx as tensor buffer for torch.compile compatibility
-        self.register_buffer('direction_idx', torch.tensor(0, dtype=torch.long), persistent=False)
-        # Pre-compute orthogonal directions (actual init happens in init_directions)
-        # Shape: (NUM_PRECOMPUTED * num_heads, head_dim)
-        self.register_buffer('directions', torch.zeros(self.NUM_PRECOMPUTED * num_heads, self.head_dim, dtype=torch.bfloat16), persistent=False)
+        self.register_buffer(
+            'directions',
+            torch.zeros(self.NUM_PRECOMPUTED, num_heads, self.head_dim, dtype=torch.bfloat16),
+            persistent=False,
+        )
 
     @torch.no_grad()
     def init_directions(self):
         """Initialize orthogonal direction vectors. Called after model is on device."""
         device = self.directions.device
         dtype = self.directions.dtype
-        # Generate orthogonal matrices and write rows directly to buffer (memory efficient)
-        # Each orthogonal matrix gives us head_dim orthonormal vectors
         total_needed = self.NUM_PRECOMPUTED * self.num_heads
+        flat_dirs = torch.empty(total_needed, self.head_dim, dtype=dtype, device=device)
         idx = 0
         while idx < total_needed:
-            # Generate orthogonal matrix on CPU to save GPU memory, then copy rows
             Q = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim, dtype=torch.float32))[0]
-            # Copy rows directly to buffer
             rows_to_copy = min(self.head_dim, total_needed - idx)
-            self.directions[idx:idx + rows_to_copy] = Q[:rows_to_copy].to(device=device, dtype=dtype)
+            flat_dirs[idx:idx + rows_to_copy] = Q[:rows_to_copy].to(device=device, dtype=dtype)
             idx += rows_to_copy
+        self.directions.copy_(flat_dirs.view(self.NUM_PRECOMPUTED, self.num_heads, self.head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.max_eps == 0:
             return x
 
-        shape = x.shape  # (B, T, dim)
-        x = x.view(-1, self.num_heads, self.head_dim)  # (B*T, num_heads, head_dim)
+        B, T, _ = x.shape
+        x_flat = x.view(-1, self.num_heads, self.head_dim)
 
-        # Compute perturbation under no_grad - we only need gradients through x, not the rotation
-        with torch.no_grad():
-            # Random eps uniform in [-max_eps, max_eps] per head
-            eps = (2 * torch.rand(self.num_heads, device=x.device, dtype=x.dtype) - 1) * self.max_eps
-            tan_eps = torch.tan(eps)  # (num_heads,)
+        rand_idx = torch.randint(0, self.NUM_PRECOMPUTED, (1,), device=x.device)
+        directions = self.directions[rand_idx].squeeze(0)  # (num_heads, head_dim)
 
-            # Get pre-computed orthogonal directions for this forward pass
-            # Use tensor ops for torch.compile compatibility (avoids recompilation)
-            total_dirs = self.NUM_PRECOMPUTED * self.num_heads
-            indices = (self.direction_idx + torch.arange(self.num_heads, device=x.device)) % total_dirs
-            directions = self.directions[indices]  # (num_heads, head_dim)
+        tan_eps = torch.tan((torch.rand(self.num_heads, device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.max_eps)
+        head_norms = torch.linalg.vector_norm(x_flat.detach(), ord=2, dim=-1, keepdim=True) + 1e-6
+        perturbation = directions.unsqueeze(0) * head_norms * tan_eps.view(1, self.num_heads, 1)
 
-            # Advance index for next forward pass (in-place tensor op for torch.compile)
-            self.direction_idx.add_(self.num_heads).fmod_(total_dirs)
+        rotated = x_flat + perturbation  # gradient flows through x_flat
 
-            # Compute perturbation (all inputs are detached/random, no grad needed)
-            head_norms = x.detach().norm(dim=-1, keepdim=True) + 1e-6  # (B*T, num_heads, 1)
-            perturbation = directions * head_norms * tan_eps.unsqueeze(0).unsqueeze(-1)
-
-        # Apply perturbation - gradient flows through x
-        rotated = x + perturbation
-
-        # Renormalize to preserve original norms (scale is detached)
-        with torch.no_grad():
-            output_norms = rotated.detach().norm(dim=-1, keepdim=True) + 1e-6
-            scale = head_norms / output_norms
-
-        return (rotated * scale).view(shape)
+        output_norms = torch.linalg.vector_norm(rotated.detach(), ord=2, dim=-1, keepdim=True) + 1e-6
+        return (rotated * (head_norms / output_norms)).view(B, T, -1)
 
 
 class CausalSelfAttention(nn.Module):
