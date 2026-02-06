@@ -1,0 +1,3 @@
+[submodule "nanochat/cuda_kernels/cutlass"]
+	path = nanochat/cuda_kernels/cutlass
+	url = https://github.com/NVIDIA/cutlass.git

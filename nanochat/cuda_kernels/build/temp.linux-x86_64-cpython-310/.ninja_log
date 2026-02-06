@@ -1,3 +1,13 @@
 # ninja log v7
-0	15875	1770074546308945365	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/bindings.o	394f72e3ac346a62
-0	59041	1770074546310719757	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	9f4f938cfca79c7c
+0	15286	1770272073864096585	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/bindings.o	527c7d3619406dfb
+1	87462	1770272073865096580	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+15	15363	1770272927914833884	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/bindings.o	527c7d3619406dfb
+15	88502	1770273006394477421	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+14	89096	1770273217148348162	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+16	89329	1770273635282457208	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+14	90155	1770273877296161394	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+14	88093	1770274193548349770	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+14	89465	1770275334164185583	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+15	15451	1770276505702391556	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/bindings.o	527c7d3619406dfb
+16	90691	1770276505703391573	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
+15	90830	1770276668138984735	/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/build/temp.linux-x86_64-cpython-310/home/eric-danziger/dev/NC2/nanochat/cuda_kernels/csrc/fused_look_around_flash.o	7f0840edb7c5f53
