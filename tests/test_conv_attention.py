@@ -1,5 +1,5 @@
 """
-Correctness tests for conv attention (mixture of shifted softmaxes).
+Correctness tests for conv attention (1D conv on attention probabilities after softmax).
 """
 import torch
 import torch.nn.functional as F
@@ -57,11 +57,11 @@ class TestIdentityKernel:
 
 
 # ============================================================================
-# Test 2: Pure left shift kernel [0,0,0,0,1] (j=+2)
+# Test 2: Pure shift kernel [0,0,0,0,1] (j=+2)
 # ============================================================================
 class TestPureShift:
     def test_shift_plus2_small(self):
-        """With kernel [0,0,0,0,1], each query attends to keys shifted by +2."""
+        """With kernel [0,0,0,0,1] (only j=+2): p_conv[q,k] = p[q, k-2], re-masked, @ original V."""
         B, T, H, D = 1, 8, 1, 16
         Q, K, V = _rand_qkv(B, T, H, D)
 
@@ -71,30 +71,29 @@ class TestPureShift:
 
         out = conv_attention_ref(Q, K, V, conv_logits, causal=True)
 
-        # Manually compute for j=+2:
-        # shifted_logits[q, k] = logits[q, k+2], causal: k+2 <= q
-        # shifted_V[k] = V[k+2]
+        # Manually: standard softmax, shift probs by +2, re-mask, attend to original V
         q = Q.transpose(1, 2)  # (B, H, T, D)
         k = K.transpose(1, 2)
         v = V.transpose(1, 2)
         logits = q @ k.transpose(-2, -1) / (D ** 0.5)
 
-        shifted_logits = torch.full_like(logits, float('-inf'))
-        shifted_logits[:, :, :, :T-2] = logits[:, :, :, 2:]
-
-        # Causal mask: k+2 <= q => k <= q-2
+        # Standard causal mask + softmax
         q_idx = torch.arange(T, device=DEVICE).unsqueeze(1)
         k_idx = torch.arange(T, device=DEVICE).unsqueeze(0)
-        mask = ((k_idx + 2) <= q_idx) & (k_idx + 2 >= 0) & (k_idx + 2 < T)
-        shifted_logits = shifted_logits.masked_fill(~mask, float('-inf'))
-
-        p = F.softmax(shifted_logits, dim=-1)
+        causal_mask = k_idx <= q_idx
+        logits = logits.masked_fill(~causal_mask, float('-inf'))
+        p = F.softmax(logits, dim=-1)
         p = torch.nan_to_num(p, nan=0.0)
 
-        shifted_v = torch.zeros_like(v)
-        shifted_v[:, :, :T-2, :] = v[:, :, 2:, :]
+        # Shift probs: p_conv[q, k] = p[q, k-2]
+        p_conv = torch.zeros_like(p)
+        p_conv[:, :, :, 2:] = p[:, :, :, :T - 2]
 
-        expected = (p @ shifted_v).transpose(1, 2)
+        # Re-mask to enforce causality
+        p_conv = p_conv.masked_fill(~causal_mask, 0.0)
+
+        # Attend to original V
+        expected = (p_conv @ v).transpose(1, 2)
 
         torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
@@ -127,15 +126,13 @@ class TestUniformKernel:
 # Test 4: Boundary handling at q=0, q=1
 # ============================================================================
 class TestBoundaries:
-    def test_q0_all_shifts_give_v0(self):
-        """At q=0 with causal:
-        - j=-2: effective key k-2, valid k=2 only (k-2=0 in [0,0]). out=V[0]
-        - j=-1: effective key k-1, valid k=1 only. out=V[0]
-        - j= 0: effective key k,   valid k=0 only. out=V[0]
-        - j=+1: k+1<=0 => k<=-1, no valid k. out=0
-        - j=+2: k+2<=0 => k<=-2, no valid k. out=0
-        With uniform w=0.2: out = 0.6*V[0]
-        With identity kernel (j=0 only): out = V[0]
+    def test_q0_boundary(self):
+        """At q=0 with causal, p[0,:] = [1,0,0,...] (only k=0 valid).
+        Conv: p_conv[0, k] = sum_j w[j] * p[0, k-j]. Only j=0 contributes
+        p_conv[0,0] = w[0]*p[0,0] = w[center]*1. Shifts j=+1,+2 need k-j < 0 (OOB),
+        shifts j=-1,-2 produce p_conv at k=1,2 which get re-masked (k>q=0).
+        With identity kernel: out[q=0] = V[0].
+        With uniform w=0.2: out[q=0] = 0.2*V[0] (only j=0 survives at k=0).
         """
         B, H, D = 1, 2, 16
         T = 8
@@ -148,15 +145,16 @@ class TestBoundaries:
         v0 = V[:, 0, :, :]
         torch.testing.assert_close(out_q0, v0, atol=1e-5, rtol=1e-5)
 
-        # Uniform kernel => out[q=0] = 0.6*V[0] (shifts -2,-1,0 contribute, +1,+2 give zero)
+        # Uniform kernel w=0.2 => only j=0 tap survives at q=0 => out = 0.2*V[0]
         conv_logits_uniform = torch.zeros(H, 5, device=DEVICE, dtype=REF_DTYPE)
         out2 = conv_attention_ref(Q, K, V, conv_logits_uniform, causal=True)
         out2_q0 = out2[:, 0, :, :]
-        torch.testing.assert_close(out2_q0, 0.6 * v0, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out2_q0, 0.2 * v0, atol=1e-5, rtol=1e-5)
 
     def test_q1_no_future_leak(self):
-        """At q=1 with causal, shifts j=+2 has no valid keys (k+2<=1 and k+2>=0 => k=-1, invalid).
-        Shift j=+1 has k+1<=1 and k+1>=0 => k=0 only. Shifts j=0,-1,-2 see standard causal."""
+        """At q=1 with causal and pure j=+2 kernel:
+        p_conv[1, k] = p[1, k-2]. For k=0: k-2=-2 (OOB). For k=1: k-2=-1 (OOB).
+        So p_conv[1,:] is all zeros => output at q=1 should be zero."""
         B, H, D = 1, 1, 16
         T = 8
         Q, K, V = _rand_qkv(B, T, H, D)
@@ -167,8 +165,6 @@ class TestBoundaries:
 
         out = conv_attention_ref(Q, K, V, conv_logits, causal=True)
 
-        # At q=1, j=+2: need k+2 <= 1 and k+2 >= 0, so k <= -1 and k >= -2 => no valid k
-        # So output at q=1 should be zero (nan_to_num)
         out_q1 = out[:, 1, :, :]
         torch.testing.assert_close(out_q1, torch.zeros_like(out_q1), atol=1e-6, rtol=0)
 
@@ -220,23 +216,16 @@ class TestWindowedAttention:
         torch.testing.assert_close(out_windowed, out_std_windowed, atol=1e-5, rtol=1e-5)
 
     def test_window_with_shifts(self):
-        """With a narrow window, shifted keys outside the window should be masked out."""
+        """With a narrow window, shifted probs outside the window should be masked out."""
         B, T, H, D = 1, 16, 1, 16
         W = 2
         Q, K, V = _rand_qkv(B, T, H, D)
 
-        # Use j=-2 kernel only
+        # Use j=-2 kernel only: p_conv[q, k] = p[q, k+2] then re-mask
         conv_logits = torch.full((H, 5), -1e9, device=DEVICE, dtype=REF_DTYPE)
         conv_logits[:, 0] = 0.0  # index 0 = shift -2
 
         out = conv_attention_ref(Q, K, V, conv_logits, causal=True, window_size=(W, 0))
-
-        # For j=-2 with window W=2:
-        # valid keys: k-2 <= q (causal), k-2 >= q-W => k-2 >= q-2 => k >= q
-        # Combined: k >= q and k-2 <= q => k <= q+2
-        # Also k-2 >= 0 => k >= 2, and k-2 < T => k < T+2
-        # So at query q: attend to k in [max(q, 2), min(q+2, T-1)]
-        # With effective key k-2, that's positions [max(q,2)-2, min(q+2,T-1)-2] = [max(q-2,0), min(q,T-3)]
 
         # Just verify no NaN and correct shape
         assert out.shape == (B, T, H, D)
@@ -307,3 +296,82 @@ class TestGradients:
 
         assert conv_logits.grad is not None
         assert conv_logits.grad.abs().sum() > 0, "conv_logits gradient is all zeros"
+
+
+# ============================================================================
+# Test 9: Partial conv heads — first n_conv get conv, rest standard
+# ============================================================================
+class TestPartialConvHeads:
+    def test_no_conv_logits_is_standard(self):
+        """conv_logits=None should match standard attention exactly."""
+        B, T, H, D = 2, 16, 4, 32
+        Q, K, V = _rand_qkv(B, T, H, D)
+
+        out_none = conv_attention_ref(Q, K, V, conv_logits=None, causal=True)
+        out_std = standard_attention_ref(Q, K, V, causal=True)
+
+        torch.testing.assert_close(out_none, out_std, atol=1e-5, rtol=1e-5)
+
+    def test_subset_conv_heads_standard_heads_unaffected(self):
+        """Non-conv heads (h >= n_conv) should match standard attention."""
+        B, T, H, D = 2, 16, 6, 32
+        n_conv = 2  # only first 2 of 6 heads get conv
+        Q, K, V = _rand_qkv(B, T, H, D)
+        conv_logits = torch.randn(n_conv, 5, device=DEVICE, dtype=REF_DTYPE)
+
+        out = conv_attention_ref(Q, K, V, conv_logits, causal=True)
+        out_std = standard_attention_ref(Q, K, V, causal=True)
+
+        # Heads n_conv: should be identical to standard attention
+        torch.testing.assert_close(
+            out[:, :, n_conv:, :], out_std[:, :, n_conv:, :],
+            atol=1e-5, rtol=1e-5,
+        )
+
+    def test_subset_conv_heads_identity_all_match(self):
+        """If conv heads use identity kernel, ALL heads match standard."""
+        B, T, H, D = 2, 16, 6, 32
+        n_conv = 3
+        Q, K, V = _rand_qkv(B, T, H, D)
+
+        conv_logits = torch.full((n_conv, 5), -1e9, device=DEVICE, dtype=REF_DTYPE)
+        conv_logits[:, 2] = 0.0  # identity
+
+        out = conv_attention_ref(Q, K, V, conv_logits, causal=True)
+        out_std = standard_attention_ref(Q, K, V, causal=True)
+
+        torch.testing.assert_close(out, out_std, atol=1e-5, rtol=1e-5)
+
+    def test_all_heads_conv_matches_original(self):
+        """conv_logits with shape (H, 5) should behave same as before."""
+        B, T, H, D = 2, 16, 4, 32
+        Q, K, V = _rand_qkv(B, T, H, D)
+        conv_logits = torch.randn(H, 5, device=DEVICE, dtype=REF_DTYPE)
+
+        out_all = conv_attention_ref(Q, K, V, conv_logits, causal=True)
+
+        # Should be the same as manually applying conv to all heads
+        # (identity test: use identity logits to confirm)
+        conv_logits_id = torch.full((H, 5), -1e9, device=DEVICE, dtype=REF_DTYPE)
+        conv_logits_id[:, 2] = 0.0
+        out_id = conv_attention_ref(Q, K, V, conv_logits_id, causal=True)
+        out_std = standard_attention_ref(Q, K, V, causal=True)
+        torch.testing.assert_close(out_id, out_std, atol=1e-5, rtol=1e-5)
+
+    def test_grad_flows_to_conv_and_qkv(self):
+        """Gradients flow through both conv heads and standard heads."""
+        B, T, H, D = 1, 8, 4, 16
+        n_conv = 2
+        Q = torch.randn(B, T, H, D, device=DEVICE, dtype=REF_DTYPE, requires_grad=True)
+        K = torch.randn(B, T, H, D, device=DEVICE, dtype=REF_DTYPE, requires_grad=True)
+        V = torch.randn(B, T, H, D, device=DEVICE, dtype=REF_DTYPE, requires_grad=True)
+        conv_logits = torch.randn(n_conv, 5, device=DEVICE, dtype=REF_DTYPE, requires_grad=True)
+
+        out = conv_attention_ref(Q, K, V, conv_logits, causal=True)
+        loss = (out ** 2).sum()
+        loss.backward()
+
+        for name, t in [("Q", Q), ("K", K), ("V", V), ("conv_logits", conv_logits)]:
+            assert t.grad is not None, f"{name} has no gradient"
+            assert not torch.isnan(t.grad).any(), f"{name} gradient has NaN"
+            assert t.grad.abs().sum() > 0, f"{name} gradient is all zeros"

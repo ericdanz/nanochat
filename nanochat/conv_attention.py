@@ -1,16 +1,14 @@
 """
-Conv Attention: 1D convolution on attention patterns via mixture of shifted softmaxes.
+Conv Attention: 1D convolution on attention probabilities after softmax.
 
-For conv kernel w = softmax(conv_logits) with shifts j in {-2, -1, 0, 1, 2}:
-  For each shift j:
-    shifted_logits[q, k] = logits[q, k+j]  (-inf where k+j is invalid)
-    p_j = softmax(shifted_logits)
-    shifted_V[k] = V[k+j]                  (0 where k+j is invalid)
-    out_j = p_j @ shifted_V
-  Final: out = sum_j w[j] * out_j
+  p = softmax(Q @ K^T / sqrt(d))           # one standard softmax (all heads)
+  w = softmax(conv_logits)                  # conv kernel, sums to 1
+  p_conv[q, k] = sum_j w[j] * p[q, k-j]   # 1D conv along key dim (first n_conv heads)
+  p_conv = re_mask(p_conv)                  # zero out causal/window violations
+  out = [p_conv; p_std] @ V                 # conv heads ++ standard heads
 
-Each p_j is a proper probability distribution. w sums to 1. Result is a convex
-combination of valid attended values with no ad-hoc renormalization.
+conv_logits shape (n_conv, 5) determines how many heads get the conv.
+Remaining heads are plain attention. If conv_logits is None, all heads standard.
 """
 import torch
 import torch.nn.functional as F
@@ -90,69 +88,60 @@ def _build_mask(Tq, Tk, causal, window_size, shift, device):
     return mask
 
 
-def conv_attention_ref(Q, K, V, conv_logits, causal=True, window_size=(-1, -1)):
+def conv_attention_ref(Q, K, V, conv_logits=None, causal=True, window_size=(-1, -1)):
     """
-    Reference conv attention (materializes full attention matrix).
+    Reference conv attention: 1D convolution on attention probabilities.
+
+    First n_conv heads get the conv (determined by conv_logits.shape[0]),
+    remaining heads get standard attention. If conv_logits is None, all
+    heads are standard.
 
     Args:
         Q, K, V: (B, T, H, D) — FA3 native layout
-        conv_logits: (H, 5) — raw learnable conv kernel per head
+        conv_logits: (n_conv, 5) or None — raw learnable conv kernel per conv head
         causal: bool
         window_size: (left, right) tuple, -1 = unlimited
     Returns:
         (B, T, H, D)
     """
     B, T, H, D = Q.shape
-    shifts = [-2, -1, 0, 1, 2]
 
     # Transpose to (B, H, T, D) for matmul
     q = Q.transpose(1, 2)
     k = K.transpose(1, 2)
     v = V.transpose(1, 2)
 
-    # Base logits: (B, H, T, T)
-    logits = q @ k.transpose(-2, -1) / (D ** 0.5)
+    # Standard attention logits + mask + ONE softmax (all heads)
+    logits = q @ k.transpose(-2, -1) / (D ** 0.5)  # (B, H, T, T)
+    mask = _build_mask(T, T, causal, window_size, shift=0, device=Q.device)
+    logits = logits.masked_fill(~mask, float('-inf'))
+    p = F.softmax(logits, dim=-1)  # (B, H, T, T)
+    p = torch.nan_to_num(p, nan=0.0)
 
-    # Conv kernel weights: softmax over the 5 shifts per head
-    w = F.softmax(conv_logits, dim=-1)  # (H, 5)
+    # Apply conv to the first n_conv heads (if any)
+    if conv_logits is not None:
+        n_conv = conv_logits.shape[0]
+        shifts = [-2, -1, 0, 1, 2]
+        w = F.softmax(conv_logits, dim=-1)  # (n_conv, 5)
 
-    out = torch.zeros_like(q)  # (B, H, T, D)
+        p_head = p[:, :n_conv]  # (B, n_conv, T, T)
+        p_conv = torch.zeros_like(p_head)
 
-    for idx, j in enumerate(shifts):
-        # Build shifted logits by slicing (no wrapping)
-        shifted_logits = torch.full_like(logits, float('-inf'))
+        for idx, j in enumerate(shifts):
+            shifted_p = torch.zeros_like(p_head)
+            if j >= 0:
+                if j < T:
+                    shifted_p[:, :, :, j:] = p_head[:, :, :, :T - j]
+            else:
+                if -j < T:
+                    shifted_p[:, :, :, :T + j] = p_head[:, :, :, -j:]
 
-        # logits[q, k] with effective key k+j means we read from logits[:, :, q, k+j]
-        # For shifted_logits[q, k] = logits[q, k+j]:
-        #   source column: k+j, so source range [max(0,j), T+min(0,j)) in source
-        #   dest column:   k,   so dest range   [max(0,-j), T+min(0,-j)) in dest
-        if j >= 0:
-            src_start, src_end = j, T
-            dst_start, dst_end = 0, T - j
-        else:
-            src_start, src_end = 0, T + j
-            dst_start, dst_end = -j, T
+            p_conv = p_conv + w[:, idx].view(1, n_conv, 1, 1) * shifted_p
 
-        shifted_logits[:, :, :, dst_start:dst_end] = logits[:, :, :, src_start:src_end]
+        # Re-mask: conv can push probability to invalid destinations
+        p_conv = p_conv.masked_fill(~mask, 0.0)
+        p = torch.cat([p_conv, p[:, n_conv:]], dim=1)
 
-        # Apply causal + window mask
-        mask = _build_mask(T, T, causal, window_size, shift=j, device=Q.device)
-        shifted_logits = shifted_logits.masked_fill(~mask, float('-inf'))
-
-        # Softmax over keys, nan_to_num for all-masked rows
-        p_j = F.softmax(shifted_logits, dim=-1)
-        p_j = torch.nan_to_num(p_j, nan=0.0)
-
-        # Build shifted V: shifted_V[k] = V[k+j], 0 where out of bounds
-        shifted_v = torch.zeros_like(v)
-        if j >= 0:
-            shifted_v[:, :, :T - j, :] = v[:, :, j:, :]
-        else:
-            shifted_v[:, :, -j:, :] = v[:, :, :T + j, :]
-
-        out_j = p_j @ shifted_v  # (B, H, T, D)
-
-        # Weight by conv kernel: w[h, idx] broadcast over (B, H, T, D)
-        out = out + w[:, idx].view(1, H, 1, 1) * out_j
-
+    # Attend to original V
+    out = p @ v  # (B, H, T, D)
     return out.transpose(1, 2)  # back to (B, T, H, D)
