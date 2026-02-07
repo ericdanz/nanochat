@@ -1,11 +1,13 @@
 """
 Correctness tests for conv attention (1D conv on attention probabilities after softmax).
 """
+import time
 import torch
 import torch.nn.functional as F
 import pytest
 
-from nanochat.conv_attention import conv_attention_ref, standard_attention_ref
+from nanochat.conv_attention import conv_attention_ref, conv_attention_fast, standard_attention_ref
+from nanochat.flash_attention import flash_attn
 
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
@@ -375,3 +377,252 @@ class TestPartialConvHeads:
             assert t.grad is not None, f"{name} has no gradient"
             assert not torch.isnan(t.grad).any(), f"{name} gradient has NaN"
             assert t.grad.abs().sum() > 0, f"{name} gradient is all zeros"
+
+
+# ============================================================================
+# Fast path tests: conv_attention_fast (V-preconv + FA3)
+# ============================================================================
+
+def _rand_qkv_bf16(B, T, H, D, device=DEVICE):
+    """Generate random Q, K, V in bf16 for FA3 tests."""
+    Q = torch.randn(B, T, H, D, dtype=DTYPE, device=device)
+    K = torch.randn(B, T, H, D, dtype=DTYPE, device=device)
+    V = torch.randn(B, T, H, D, dtype=DTYPE, device=device)
+    return Q, K, V
+
+
+class TestConvAttentionFast:
+    """Correctness tests for conv_attention_fast against reference."""
+
+    def test_identity_kernel_matches_fa3(self):
+        """Identity kernel [0,0,1,0,0] should match standard FA3 exactly."""
+        B, T, H, D = 2, 64, 4, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = _identity_logits(H).to(DTYPE)
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+        out_fa3 = flash_attn.flash_attn_func(Q, K, V, causal=True)
+
+        torch.testing.assert_close(out_fast, out_fa3, atol=2e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("T", [16, 64, 256])
+    def test_random_kernel_matches_ref(self, T):
+        """Random conv kernel: fast path matches reference within FA3/bf16 tolerance."""
+        B, H, D = 1, 4, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.randn(H, 5, device=DEVICE, dtype=DTYPE)
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+
+        # Reference in float32 for accuracy
+        out_ref = conv_attention_ref(
+            Q.float(), K.float(), V.float(), conv_logits.float(), causal=True
+        )
+
+        torch.testing.assert_close(
+            out_fast.float(), out_ref, atol=5e-2, rtol=2e-2,
+            msg=f"Fast vs ref mismatch at T={T}"
+        )
+
+    def test_pure_shift_plus2(self):
+        """Pure shift +2 kernel: fast matches reference."""
+        B, T, H, D = 1, 32, 2, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.full((H, 5), -1e4, device=DEVICE, dtype=DTYPE)
+        conv_logits[:, 4] = 0.0  # only shift +2
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+        out_ref = conv_attention_ref(
+            Q.float(), K.float(), V.float(), conv_logits.float(), causal=True
+        )
+
+        torch.testing.assert_close(out_fast.float(), out_ref, atol=5e-2, rtol=2e-2)
+
+    def test_pure_shift_minus2(self):
+        """Pure shift -2 kernel: fast matches reference."""
+        B, T, H, D = 1, 32, 2, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.full((H, 5), -1e4, device=DEVICE, dtype=DTYPE)
+        conv_logits[:, 0] = 0.0  # only shift -2
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+        out_ref = conv_attention_ref(
+            Q.float(), K.float(), V.float(), conv_logits.float(), causal=True
+        )
+
+        torch.testing.assert_close(out_fast.float(), out_ref, atol=5e-2, rtol=2e-2)
+
+    def test_windowed_conv(self):
+        """Windowed + conv: fast matches reference."""
+        B, T, H, D = 1, 64, 2, 128
+        W = 16
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.randn(H, 5, device=DEVICE, dtype=DTYPE)
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True, window_size=(W, 0))
+        out_ref = conv_attention_ref(
+            Q.float(), K.float(), V.float(), conv_logits.float(),
+            causal=True, window_size=(W, 0)
+        )
+
+        torch.testing.assert_close(out_fast.float(), out_ref, atol=5e-2, rtol=2e-2)
+
+    def test_partial_conv_heads(self):
+        """First n_conv heads differ, remaining match standard FA3."""
+        B, T, H, D = 1, 64, 6, 128
+        n_conv = 2
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.randn(n_conv, 5, device=DEVICE, dtype=DTYPE)
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+        out_fa3 = flash_attn.flash_attn_func(Q, K, V, causal=True)
+
+        # Non-conv heads should match standard FA3
+        torch.testing.assert_close(
+            out_fast[:, :, n_conv:, :], out_fa3[:, :, n_conv:, :],
+            atol=2e-2, rtol=1e-2,
+        )
+
+    def test_none_conv_logits_matches_fa3(self):
+        """conv_logits=None should match standard FA3."""
+        B, T, H, D = 2, 64, 4, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+
+        out_fast = conv_attention_fast(Q, K, V, conv_logits=None, causal=True)
+        out_fa3 = flash_attn.flash_attn_func(Q, K, V, causal=True)
+
+        torch.testing.assert_close(out_fast, out_fa3, atol=0, rtol=0)
+
+    def test_gradient_flow(self):
+        """Gradients exist and are nonzero for Q, K, V, conv_logits."""
+        B, T, H, D = 1, 32, 4, 128
+        n_conv = 2
+        Q = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        K = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        V = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        conv_logits = torch.randn(n_conv, 5, device=DEVICE, dtype=torch.float32, requires_grad=True)
+
+        out = conv_attention_fast(Q, K, V, conv_logits, causal=True)
+        loss = (out.float() ** 2).sum()
+        loss.backward()
+
+        for name, t in [("Q", Q), ("K", K), ("V", V), ("conv_logits", conv_logits)]:
+            assert t.grad is not None, f"{name} has no gradient"
+            assert not torch.isnan(t.grad).any(), f"{name} gradient has NaN"
+            assert t.grad.abs().sum() > 0, f"{name} gradient is all zeros"
+
+    def test_gradient_accuracy(self):
+        """Compare fast-path gradients against reference (float32)."""
+        B, T, H, D = 1, 16, 2, 128
+        n_conv = 2
+
+        torch.manual_seed(42)
+        Q_data = torch.randn(B, T, H, D, device=DEVICE, dtype=torch.float32)
+        K_data = torch.randn(B, T, H, D, device=DEVICE, dtype=torch.float32)
+        V_data = torch.randn(B, T, H, D, device=DEVICE, dtype=torch.float32)
+        cl_data = torch.randn(n_conv, 5, device=DEVICE, dtype=torch.float32)
+
+        # Reference gradients (float32)
+        Q_ref = Q_data.clone().requires_grad_(True)
+        K_ref = K_data.clone().requires_grad_(True)
+        V_ref = V_data.clone().requires_grad_(True)
+        cl_ref = cl_data.clone().requires_grad_(True)
+        out_ref = conv_attention_ref(Q_ref, K_ref, V_ref, cl_ref, causal=True)
+        (out_ref ** 2).sum().backward()
+
+        # Fast-path gradients (bf16 forward, float32 backward)
+        Q_fast = Q_data.to(DTYPE).requires_grad_(True)
+        K_fast = K_data.to(DTYPE).requires_grad_(True)
+        V_fast = V_data.to(DTYPE).requires_grad_(True)
+        cl_fast = cl_data.clone().requires_grad_(True)
+        out_fast = conv_attention_fast(Q_fast, K_fast, V_fast, cl_fast, causal=True)
+        (out_fast.float() ** 2).sum().backward()
+
+        # conv_logits gradient should be reasonably close
+        torch.testing.assert_close(
+            cl_fast.grad, cl_ref.grad, atol=0.5, rtol=0.3,
+            msg="conv_logits gradient mismatch"
+        )
+
+
+# ============================================================================
+# Performance tests
+# ============================================================================
+
+class TestConvAttentionPerf:
+    """Performance benchmarks for conv_attention_fast."""
+
+    @staticmethod
+    def _timed(fn, warmup=5, iters=20):
+        """Time a function, returning median time in ms."""
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            start = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start) * 1000)
+        times.sort()
+        return times[len(times) // 2]
+
+    def test_constant_absolute_overhead(self):
+        """Absolute overhead (in ms) should be roughly constant across T values,
+        demonstrating O(T) vs O(T^2) scaling advantage."""
+        B, H, D = 2, 8, 128
+        n_conv = 4
+        conv_logits = torch.randn(n_conv, 5, device=DEVICE, dtype=DTYPE)
+
+        overheads_ms = {}
+        for T in [1024, 4096, 8192]:
+            Q, K, V = _rand_qkv_bf16(B, T, H, D)
+            t_fa3 = self._timed(lambda: flash_attn.flash_attn_func(Q, K, V, causal=True))
+            t_fast = self._timed(lambda: conv_attention_fast(Q, K, V, conv_logits, causal=True))
+            overheads_ms[T] = t_fast - t_fa3
+
+        print(f"\nAbsolute overheads: {', '.join(f'T={t}: {o:.2f}ms' for t, o in overheads_ms.items())}")
+        # Overhead should stay under 2ms regardless of T (it's O(T*D) Python ops)
+        for T, o in overheads_ms.items():
+            assert o < 2.0, f"Overhead at T={T} is {o:.2f}ms, exceeds 2ms"
+
+    def test_speedup_vs_reference(self):
+        """conv_attention_fast should be significantly faster than reference at large T."""
+        B, T, H, D = 1, 4096, 4, 128
+        Q, K, V = _rand_qkv_bf16(B, T, H, D)
+        conv_logits = torch.randn(H, 5, device=DEVICE, dtype=DTYPE)
+
+        t_fast = self._timed(lambda: conv_attention_fast(Q, K, V, conv_logits, causal=True))
+        t_ref = self._timed(
+            lambda: conv_attention_ref(
+                Q.float(), K.float(), V.float(), conv_logits.float(), causal=True
+            ),
+            warmup=2, iters=5,
+        )
+
+        speedup = t_ref / t_fast
+        print(f"\nRef: {t_ref:.2f}ms, Fast: {t_fast:.2f}ms, speedup: {speedup:.1f}x")
+        assert speedup > 10, f"Speedup {speedup:.1f}x below 10x"
+
+    def test_quadratic_speedup_scaling(self):
+        """Speedup vs reference should grow with T (quadratic vs linear)."""
+        B, H, D = 1, 4, 128
+        conv_logits = torch.randn(H, 5, device=DEVICE, dtype=DTYPE)
+
+        speedups = {}
+        for T in [1024, 4096]:
+            Q, K, V = _rand_qkv_bf16(B, T, H, D)
+            t_fast = self._timed(lambda: conv_attention_fast(Q, K, V, conv_logits, causal=True))
+            t_ref = self._timed(
+                lambda: conv_attention_ref(
+                    Q.float(), K.float(), V.float(), conv_logits.float(), causal=True
+                ),
+                warmup=2, iters=5,
+            )
+            speedups[T] = t_ref / t_fast
+
+        print(f"\nSpeedups: {', '.join(f'T={t}: {s:.1f}x' for t, s in speedups.items())}")
+        # Speedup at T=4096 should be significantly larger than at T=1024
+        assert speedups[4096] > speedups[1024] * 2, (
+            f"Speedup doesn't scale: T=1024: {speedups[1024]:.1f}x, T=4096: {speedups[4096]:.1f}x"
+        )

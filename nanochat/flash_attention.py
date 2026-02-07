@@ -92,7 +92,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), return_attn_probs=False):
     """
     Flash Attention for training (no KV cache).
 
@@ -100,13 +100,17 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        return_attn_probs: If True, return (out, softmax_lse). FA3 only.
 
     Returns:
-        Output tensor of shape (B, T, H, D)
+        Output tensor of shape (B, T, H, D), or (out, softmax_lse) if return_attn_probs=True.
+        softmax_lse shape: (B, H, T).
     """
     if _use_fa3():
-        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+        return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size,
+                                     return_attn_probs=return_attn_probs)
 
+    assert not return_attn_probs, "return_attn_probs requires FA3 (not available with SDPA fallback)"
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
