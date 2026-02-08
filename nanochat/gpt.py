@@ -92,26 +92,32 @@ class RotationRegularizer(nn.Module):
             idx += rows_to_copy
         self.directions.copy_(flat_dirs.view(self.NUM_PRECOMPUTED, self.num_heads, self.head_dim))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def sample_randoms(self, device):
+        """Generate random direction and tan_eps for one layer. Call outside torch.compile."""
+        rand_idx = torch.randint(0, self.NUM_PRECOMPUTED, (1,), device=device)
+        direction = self.directions[rand_idx].squeeze(0)  # (num_heads, head_dim)
+        u = (torch.rand(self.num_heads, device=device, dtype=torch.bfloat16) * 2.0 - 1.0) * self.max_eps
+        tan_eps = torch.tan(u)  # (num_heads,)
+        return direction, tan_eps
+
+    def forward(self, x: torch.Tensor, randoms=None) -> torch.Tensor:
         if not self.training or self.max_eps == 0:
             return x
 
         B, T, _ = x.shape
         x_flat = x.view(-1, self.num_heads, self.head_dim)
 
-        # sample directions: (num_heads, head_dim)
-        rand_idx = torch.randint(0, self.NUM_PRECOMPUTED, (1,), device=x.device)
-        directions = self.directions[rand_idx].squeeze(0)
-
-        # per-head eps: (num_heads,)
-        u = (torch.rand(self.num_heads, device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.max_eps
-        tan_eps = torch.tan(u)
+        # Use pre-computed randoms if provided, otherwise generate (fallback for inference/testing)
+        if randoms is not None:
+            direction, tan_eps = randoms
+        else:
+            direction, tan_eps = self.sample_randoms(x.device)
 
         # per-token, per-head scale from the MLP output (detached): (B*T, num_heads, 1)
         head_rms = (x_flat.detach().pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
 
         # perturbation: (B*T, num_heads, head_dim)
-        perturb = directions.unsqueeze(0) * head_rms * tan_eps.view(1, self.num_heads, 1)
+        perturb = direction.unsqueeze(0) * head_rms * tan_eps.view(1, self.num_heads, 1)
 
         out = x_flat + perturb
         return out.view(B, T, -1)
@@ -188,12 +194,12 @@ class MLP(nn.Module):
         use_rotation = config.rotation_max_eps > 0 and layer_idx % 2 == 0
         self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if use_rotation else None
 
-    def forward(self, x):
+    def forward(self, x, rotation_randoms=None):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
         if self.rotation is not None:
-            x = self.rotation(x)
+            x = self.rotation(x, rotation_randoms)
         return x
 
 
@@ -203,9 +209,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config, layer_idx)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, rotation_randoms=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.mlp(norm(x), rotation_randoms)
         return x
 
 
@@ -456,7 +462,15 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def sample_rotation_randoms(self, device):
+        """Pre-compute all rotation randoms for one forward pass. Call outside torch.compile."""
+        randoms = {}
+        for i, block in enumerate(self.transformer.h):
+            if block.mlp.rotation is not None:
+                randoms[i] = block.mlp.rotation.sample_randoms(device)
+        return randoms
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', rotation_randoms=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -474,7 +488,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            rot_rand = rotation_randoms.get(i) if rotation_randoms is not None else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, rot_rand)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
