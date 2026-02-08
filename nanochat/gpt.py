@@ -99,17 +99,22 @@ class RotationRegularizer(nn.Module):
         B, T, _ = x.shape
         x_flat = x.view(-1, self.num_heads, self.head_dim)
 
+        # sample directions: (num_heads, head_dim)
         rand_idx = torch.randint(0, self.NUM_PRECOMPUTED, (1,), device=x.device)
-        directions = self.directions[rand_idx].squeeze(0)  # (num_heads, head_dim)
+        directions = self.directions[rand_idx].squeeze(0)
 
-        tan_eps = torch.tan((torch.rand(self.num_heads, device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.max_eps)
-        head_norms = torch.linalg.vector_norm(x_flat.detach(), ord=2, dim=-1, keepdim=True) + 1e-6
-        perturbation = directions.unsqueeze(0) * head_norms * tan_eps.view(1, self.num_heads, 1)
+        # per-head eps: (num_heads,)
+        u = (torch.rand(self.num_heads, device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.max_eps
+        tan_eps = torch.tan(u)
 
-        rotated = x_flat + perturbation  # gradient flows through x_flat
+        # per-token, per-head scale from the MLP output (detached): (B*T, num_heads, 1)
+        head_rms = (x_flat.detach().pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
 
-        output_norms = torch.linalg.vector_norm(rotated.detach(), ord=2, dim=-1, keepdim=True) + 1e-6
-        return (rotated * (head_norms / output_norms)).view(B, T, -1)
+        # perturbation: (B*T, num_heads, head_dim)
+        perturb = directions.unsqueeze(0) * head_rms * tan_eps.view(1, self.num_heads, 1)
+
+        out = x_flat + perturb
+        return out.view(B, T, -1)
 
 
 class CausalSelfAttention(nn.Module):
