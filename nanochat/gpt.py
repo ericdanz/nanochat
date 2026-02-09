@@ -58,53 +58,29 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
-class RotationRegularizer(nn.Module):
-    """Per-head random rotation regularizer. Only active during training.
+class HyperspherePerturbation(nn.Module):
+    """Per-token random hypersphere perturbation. Only active during training.
 
-    Stateless: randomly samples pre-computed orthogonal directions each forward pass.
-    Directions stored as (NUM_PRECOMPUTED, num_heads, head_dim) for contiguous slicing.
+    Stateless: generates random Gaussian noise on-the-fly, normalized to unit sphere,
+    scaled by detached input norm * random epsilon per token. No buffers, no precomputation.
     """
-    NUM_PRECOMPUTED = 2048
-
-    def __init__(self, dim: int, num_heads: int, max_eps: float = 0.1):
+    def __init__(self, max_eps: float = 0.1):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
         self.max_eps = max_eps
-        self.register_buffer(
-            'directions',
-            torch.zeros(self.NUM_PRECOMPUTED, num_heads, self.head_dim, dtype=torch.bfloat16),
-            persistent=False,
-        )
-
-    @torch.no_grad()
-    def init_directions(self):
-        """Initialize orthogonal direction vectors. Called after model is on device."""
-        device = self.directions.device
-        dtype = self.directions.dtype
-        total_needed = self.NUM_PRECOMPUTED * self.num_heads
-        flat_dirs = torch.empty(total_needed, self.head_dim, dtype=dtype, device=device)
-        idx = 0
-        while idx < total_needed:
-            Q = torch.linalg.qr(torch.randn(self.head_dim, self.head_dim, dtype=torch.float32))[0]
-            rows_to_copy = min(self.head_dim, total_needed - idx)
-            flat_dirs[idx:idx + rows_to_copy] = Q[:rows_to_copy].to(device=device, dtype=dtype)
-            idx += rows_to_copy
-        self.directions.copy_(flat_dirs.view(self.NUM_PRECOMPUTED, self.num_heads, self.head_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.max_eps == 0:
             return x
 
-        B, T, C = x.shape
-        rand_idx = torch.randint(0, self.NUM_PRECOMPUTED, (1,), device=x.device)
-        direction = self.directions[rand_idx].squeeze(0)  # (num_heads, head_dim)
-        u = (torch.rand(self.num_heads, device=x.device, dtype=x.dtype) * 2.0 - 1.0) * self.max_eps
+        # Random direction on unit hypersphere per token
+        noise = torch.randn_like(x)
+        noise = noise / (noise.norm(dim=-1, keepdim=True) + 1e-8)
 
-        x_flat = x.view(-1, self.num_heads, self.head_dim)
-        head_rms = (x_flat.detach().pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+        # Scale by detached input norm * random epsilon per token
+        x_norm = x.detach().norm(dim=-1, keepdim=True)
+        eps = torch.rand(*x.shape[:-1], 1, device=x.device, dtype=x.dtype) * self.max_eps
 
-        return (x_flat + direction * head_rms * u.view(1, -1, 1)).view(B, T, C)
+        return x + noise * x_norm * eps
 
 
 class CausalSelfAttention(nn.Module):
@@ -174,16 +150,16 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        # Rotation regularizer only on even layers to save memory
-        use_rotation = config.rotation_max_eps > 0 and layer_idx % 2 == 0
-        self.rotation = RotationRegularizer(config.n_embd, config.n_head, config.rotation_max_eps) if use_rotation else None
+        # Hypersphere perturbation only on even layers
+        use_perturb = config.rotation_max_eps > 0 and layer_idx % 2 == 0
+        self.perturb = HyperspherePerturbation(config.rotation_max_eps) if use_perturb else None
 
     def forward(self, x):
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
-        if self.rotation is not None:
-            x = self.rotation(x)
+        if self.perturb is not None:
+            x = self.perturb(x)
         return x
 
 
@@ -289,11 +265,6 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-
-        # Initialize rotation regularizer directions (orthogonal pre-computed)
-        for block in self.transformer.h:
-            if block.mlp.rotation is not None:
-                block.mlp.rotation.init_directions()
 
         # Cast embeddings to bf16: optimizer can tolerate it and it saves memory
         if self.transformer.wte.weight.device.type == "cuda":
