@@ -150,8 +150,8 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        # Hypersphere perturbation only on even layers
-        use_perturb = config.rotation_max_eps > 0 and layer_idx % 2 == 0
+        # Hypersphere perturbation only on odd layers
+        use_perturb = config.rotation_max_eps > 0 and layer_idx % 2 == 1
         self.perturb = HyperspherePerturbation(config.rotation_max_eps) if use_perturb else None
 
     def forward(self, x):
