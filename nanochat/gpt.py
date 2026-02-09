@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # LearnedRotation: norm-preserving tangent kick on per-head subspaces
+    # Placement: after_attn, inner_mlp (dim=4*n_embd), before_residual, after_residual
+    rotation_placement: str = "after_residual"
+    rotation_alpha_scale: float = 1.0  # scales tanh output: alpha in [-scale, scale]
 
 
 def norm(x):
@@ -124,11 +128,56 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, rotation=None):
         x = self.c_fc(x)
         x = F.relu(x).square()
+        if rotation is not None:
+            x = rotation(x)
         x = self.c_proj(x)
         return x
+
+
+class LearnedRotation(nn.Module):
+    def __init__(self, dim, n_head, alpha_scale=1.0):
+        super().__init__()
+        self.n_head = n_head
+        self.head_dim = dim // n_head
+        self.alpha_scale = alpha_scale
+        hidden_dim = 64
+        # 2-layer MLP: x -> hidden (tanh) -> alpha per head (tanh-bounded)
+        self.angle_fc1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.angle_fc2 = nn.Linear(hidden_dim, n_head, bias=False)
+        # Learned direction vector per head
+        self.direction = nn.Parameter(torch.empty(n_head, self.head_dim))
+
+    def forward(self, x):
+        B, T, C = x.size()
+
+        # Predict rotation strength per head, scaled tanh for bounded alpha
+        alpha = self.alpha_scale * torch.tanh(self.angle_fc2(torch.tanh(self.angle_fc1(x))))  # (B, T, n_head)
+
+        # Per-head view
+        x_heads = x.view(B, T, self.n_head, self.head_dim)
+
+        # Compute dot_xx once, derive input_norm from it (avoids redundant sum-of-squares)
+        dot_xx = x_heads.square().sum(dim=-1, keepdim=True)     # (B, T, n_head, 1)
+        input_norm = dot_xx.sqrt().clamp(min=1e-8)              # for norm restoration after kick
+
+        # Normalized direction
+        d = F.normalize(self.direction, dim=-1)  # (n_head, head_dim)
+
+        # Tangent: component of d orthogonal to x (in the x-d plane)
+        dot_xd = (x_heads * d).sum(dim=-1, keepdim=True)       # (B, T, n_head, 1)
+        tangent = d - (dot_xd / (dot_xx + 1e-8)) * x_heads     # orthogonal to x
+
+        # Apply tangent kick
+        x_shifted = x_heads + alpha.unsqueeze(-1) * tangent
+
+        # Restore per-head norm to input magnitude
+        shifted_norm = x_shifted.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        x_out = x_shifted * (input_norm / shifted_norm)
+
+        return x_out.view(B, T, C)
 
 
 class Block(nn.Module):
@@ -136,10 +185,22 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.rotation_placement = config.rotation_placement
+        rot_dim = 4 * config.n_embd if config.rotation_placement == 'inner_mlp' else config.n_embd
+        self.rotation = LearnedRotation(rot_dim, config.n_head, config.rotation_alpha_scale)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        if self.rotation_placement == 'after_attn':
+            x = self.rotation(x)
+        if self.rotation_placement == 'inner_mlp':
+            x = x + self.mlp(norm(x), rotation=self.rotation)
+        elif self.rotation_placement == 'before_residual':
+            x = x + self.rotation(self.mlp(norm(x)))
+        else:  # after_attn or after_residual
+            x = x + self.mlp(norm(x))
+        if self.rotation_placement == 'after_residual':
+            x = self.rotation(x)
         return x
 
 
@@ -228,6 +289,14 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # LearnedRotation: zero-init angle_fc2 so alpha=0 => identity rotation at init
+        for block in self.transformer.h:
+            rot_in = block.rotation.angle_fc1.in_features
+            s_rot = 3**0.5 * rot_in**-0.5
+            torch.nn.init.uniform_(block.rotation.angle_fc1.weight, -s_rot, s_rot)
+            torch.nn.init.zeros_(block.rotation.angle_fc2.weight)
+            torch.nn.init.normal_(block.rotation.direction, mean=0.0, std=1.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head

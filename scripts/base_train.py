@@ -51,6 +51,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--rotation-placement", type=str, default="after_residual", choices=["after_attn", "inner_mlp", "before_residual", "after_residual"], help="where to apply LearnedRotation in each block")
+parser.add_argument("--rotation-alpha-scale", type=float, default=1.0, help="max rotation strength: alpha in [-scale, scale]")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -133,6 +135,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        rotation_placement=args.rotation_placement,
+        rotation_alpha_scale=args.rotation_alpha_scale,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -542,6 +546,14 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # Log LearnedRotation direction stats per layer
+        for i, block in enumerate(orig_model.transformer.h):
+            d = block.rotation.direction.detach()
+            d_norms = d.norm(dim=-1)  # per-head norms (n_head,)
+            log_data[f"rotation/layer{i}_dir_mean"] = d_norms.mean().item()
+            log_data[f"rotation/layer{i}_dir_min"] = d_norms.min().item()
+            log_data[f"rotation/layer{i}_dir_max"] = d_norms.max().item()
+
         wandb_run.log(log_data)
 
     # state update

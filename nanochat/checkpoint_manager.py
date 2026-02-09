@@ -26,6 +26,12 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "rotation_placement" not in model_config_kwargs:
+        model_config_kwargs["rotation_placement"] = "after_residual"
+        log0(f"Patching missing rotation_placement in model config to 'after_residual'")
+    if "rotation_alpha_scale" not in model_config_kwargs:
+        model_config_kwargs["rotation_alpha_scale"] = 1.0
+        log0(f"Patching missing rotation_alpha_scale in model config to 1.0")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -38,6 +44,17 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+
+    # LearnedRotation defaults (identity rotation: angle_fc2 zero => alpha=0)
+    rot_dim = 4 * model_config.n_embd if model_config.rotation_placement == 'inner_mlp' else model_config.n_embd
+    rot_head_dim = rot_dim // model_config.n_head
+    for i in range(n_layer):
+        prefix = f"transformer.h.{i}.rotation."
+        if f"{prefix}angle_fc2.weight" not in model_data:
+            model_data[f"{prefix}angle_fc1.weight"] = torch.zeros(64, rot_dim)
+            model_data[f"{prefix}angle_fc2.weight"] = torch.zeros(model_config.n_head, 64)
+            model_data[f"{prefix}direction"] = torch.randn(model_config.n_head, rot_head_dim)
+            log0(f"Patching missing LearnedRotation in layer {i}")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
