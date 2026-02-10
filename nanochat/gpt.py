@@ -186,8 +186,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
         self.rotation_placement = config.rotation_placement
-        rot_dim = 4 * config.n_embd if config.rotation_placement == 'inner_mlp' else config.n_embd
-        self.rotation = LearnedRotation(rot_dim, config.n_head, config.rotation_alpha_scale)
+        if config.rotation_placement != 'none':
+            rot_dim = 4 * config.n_embd if config.rotation_placement == 'inner_mlp' else config.n_embd
+            self.rotation = LearnedRotation(rot_dim, config.n_head, config.rotation_alpha_scale)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -197,7 +198,7 @@ class Block(nn.Module):
             x = x + self.mlp(norm(x), rotation=self.rotation)
         elif self.rotation_placement == 'before_residual':
             x = x + self.rotation(self.mlp(norm(x)))
-        else:  # after_attn or after_residual
+        else:  # after_attn, after_residual, or none
             x = x + self.mlp(norm(x))
         if self.rotation_placement == 'after_residual':
             x = self.rotation(x)

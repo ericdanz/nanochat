@@ -51,7 +51,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-parser.add_argument("--rotation-placement", type=str, default="after_residual", choices=["after_attn", "inner_mlp", "before_residual", "after_residual"], help="where to apply LearnedRotation in each block")
+parser.add_argument("--rotation-placement", type=str, default="after_residual", choices=["none", "after_attn", "inner_mlp", "before_residual", "after_residual"], help="where to apply LearnedRotation in each block ('none' to disable)")
 parser.add_argument("--rotation-alpha-scale", type=float, default=1.0, help="max rotation strength: alpha in [-scale, scale]")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
