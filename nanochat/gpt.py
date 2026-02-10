@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Multi-token prediction: total output heads (1 = standard next-token, >1 = predict next K tokens)
+    n_mtp_heads: int = 1
+    mtp_loss_weight: float = 0.2
 
 
 def norm(x):
@@ -165,6 +168,13 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+        # Auxiliary projections for multi-token prediction (training only)
+        # Each transforms hidden states before the shared lm_head for full cross-entropy loss.
+        # n_embd x n_embd per head — the lm_head is reused, so no extra vocab-sized params.
+        self.mtp_projs = nn.ModuleList([
+            nn.Linear(config.n_embd, config.n_embd, bias=False)
+            for _ in range(config.n_mtp_heads - 1)
+        ]) if config.n_mtp_heads > 1 else nn.ModuleList()
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -204,6 +214,8 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        for proj in self.mtp_projs:
+            torch.nn.init.zeros_(proj.weight)  # start as identity-ish (no-op projection)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
@@ -302,10 +314,12 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Exclude non-matmul params: embeddings, per-layer scalars, and MTP projs (training-only)
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        mtp_projs_numel = sum(p.numel() for p in self.mtp_projs.parameters())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
+                          mtp_projs_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -332,14 +346,16 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        mtp_projs = sum(p.numel() for p in self.mtp_projs.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + mtp_projs + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
+            'mtp_projs': mtp_projs,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
@@ -350,7 +366,7 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_projs.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -416,7 +432,24 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
+            V = self.config.vocab_size
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+
+            # Multi-token prediction: project hidden states per head, then reuse the shared lm_head
+            # for full cross-entropy loss against future tokens. Each mtp_proj learns to transform
+            # hidden states so that lm_head(proj(x)) predicts token t+k+1.
+            if self.training and len(self.mtp_projs) > 0:
+                aux_losses = []
+                for k, proj in enumerate(self.mtp_projs, start=1):
+                    mtp_logits = self.lm_head(proj(x[:, :T-k]))  # (B, T-k, padded_vocab_size)
+                    mtp_logits = mtp_logits[..., :V]
+                    mtp_logits = mtp_logits.float()
+                    mtp_logits = softcap * torch.tanh(mtp_logits / softcap)
+                    future_targets = targets[:, k:]  # (B, T-k)
+                    aux_loss = F.cross_entropy(mtp_logits.view(-1, V), future_targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
+                    aux_losses.append(aux_loss)
+                loss = loss + self.config.mtp_loss_weight * sum(aux_losses) / len(aux_losses)
+
             return loss
         else:
             # inference: just return the logits directly
