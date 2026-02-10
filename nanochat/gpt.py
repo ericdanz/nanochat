@@ -215,7 +215,7 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
         for proj in self.mtp_projs:
-            torch.nn.init.zeros_(proj.weight)  # start as identity-ish (no-op projection)
+            torch.nn.init.eye_(proj.weight)  # start as identity → aux heads match main head, then specialize
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
