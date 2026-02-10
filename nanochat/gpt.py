@@ -161,7 +161,7 @@ class LearnedRotation(nn.Module):
 
         # Compute dot_xx once, derive input_norm from it (avoids redundant sum-of-squares)
         dot_xx = x_heads.square().sum(dim=-1, keepdim=True)     # (B, T, n_head, 1)
-        input_norm = dot_xx.sqrt().clamp(min=1e-8)              # for norm restoration after kick
+        input_norm = (dot_xx + 1e-8).sqrt()                     # eps inside sqrt to avoid NaN grad at zero
 
         # Normalized direction
         d = F.normalize(self.direction, dim=-1)  # (n_head, head_dim)
@@ -174,7 +174,7 @@ class LearnedRotation(nn.Module):
         x_shifted = x_heads + alpha.unsqueeze(-1) * tangent
 
         # Restore per-head norm to input magnitude
-        shifted_norm = x_shifted.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        shifted_norm = (x_shifted.square().sum(dim=-1, keepdim=True) + 1e-8).sqrt()
         x_out = x_shifted * (input_norm / shifted_norm)
 
         return x_out.view(B, T, C)
