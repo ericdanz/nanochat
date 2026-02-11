@@ -478,8 +478,7 @@ class GPT(nn.Module):
         # 4. Concatenate: positive at index 0, negatives at 1..N
         all_logits = torch.cat([pos_logits, neg_logits], dim=-1)  # (B, T, N+1)
 
-        # 5. Cast to fp32, apply softcap
-        all_logits = all_logits.float()
+        # 5. Apply softcap in bf16 (only 2049 classes, bf16 precision is sufficient)
         all_logits = softcap * torch.tanh(all_logits / softcap)
 
         # 6. Log-Q correction: subtract log(Q(token)) to make gradients unbiased
@@ -491,6 +490,7 @@ class GPT(nn.Module):
         # 7. CE loss with target always at index 0, handle ignore_index=-1
         # (collision masking skipped: with log-Q correction the bias from rare
         #  duplicates is negligible, and we avoid a (B,T,N) bool tensor)
+        # F.cross_entropy internally upcasts bf16→fp32 for numerical stability in logsumexp
         ce_targets = torch.zeros(B * T, dtype=torch.long, device=x.device)
         loss = F.cross_entropy(all_logits.reshape(B * T, -1), ce_targets, reduction='none')
         valid = (targets.reshape(-1) != -1).float()
