@@ -54,6 +54,9 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Multi-token prediction
 parser.add_argument("--n-mtp-heads", type=int, default=1, help="total output heads (1 = standard, >1 = predict next K tokens)")
 parser.add_argument("--mtp-loss-weight", type=float, default=0.2, help="weight for auxiliary MTP losses")
+# Sampled softmax
+parser.add_argument("--sampled-softmax-n", type=int, default=0, help="sampled softmax: number of negative samples (0=disabled, 2048=recommended)")
+parser.add_argument("--sampled-softmax-alpha", type=float, default=0.75, help="sampled softmax: frequency exponent (1.0=raw freq, 0.75=oversample rare)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +140,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         n_mtp_heads=args.n_mtp_heads, mtp_loss_weight=args.mtp_loss_weight,
+        sampled_softmax_n=args.sampled_softmax_n, sampled_softmax_alpha=args.sampled_softmax_alpha,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -160,6 +164,15 @@ if resuming:
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+
+# -----------------------------------------------------------------------------
+# Sampled softmax initialization (alias table from token frequency file)
+if model_config.sampled_softmax_n > 0:
+    import numpy as np
+    freq_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'token_freq_train.npy')
+    token_freqs = np.load(freq_path)
+    model.init_sampled_softmax(token_freqs)
+    print0(f"✓ Sampled softmax enabled: N={model_config.sampled_softmax_n}, alpha={model_config.sampled_softmax_alpha}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)

@@ -40,6 +40,9 @@ class GPTConfig:
     # Multi-token prediction: total output heads (1 = standard next-token, >1 = predict next K tokens)
     n_mtp_heads: int = 1
     mtp_loss_weight: float = 0.2
+    # Sampled softmax: 0 = disabled, 2048 = recommended
+    sampled_softmax_n: int = 0
+    sampled_softmax_alpha: float = 0.75
 
 
 def norm(x):
@@ -58,6 +61,28 @@ def apply_rotary_emb(x, cos, sin):
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
+
+def build_alias_table(probs):
+    """Build a Vose alias table for O(1) sampling from a discrete distribution (CPU).
+    Args: probs - normalized probability vector (numpy array, sums to 1)
+    Returns: (alias_prob, alias_idx) as CPU torch tensors of shape (V,)
+    """
+    n = len(probs)
+    prob = (probs * n).tolist()
+    alias_prob = [1.0] * n
+    alias_idx = list(range(n))
+    small, large = [], []
+    for i in range(n):
+        (small if prob[i] < 1.0 else large).append(i)
+    while small and large:
+        s, l = small.pop(), large.pop()
+        alias_prob[s] = prob[s]
+        alias_idx[s] = l
+        prob[l] -= (1.0 - prob[s])
+        (small if prob[l] < 1.0 else large).append(l)
+    for i in large + small:
+        alias_prob[i] = 1.0
+    return torch.tensor(alias_prob, dtype=torch.float32), torch.tensor(alias_idx, dtype=torch.int64)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -168,11 +193,10 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
-        # Auxiliary projections for multi-token prediction (training only)
-        # Each transforms hidden states before the shared lm_head for full cross-entropy loss.
-        # n_embd x n_embd per head — the lm_head is reused, so no extra vocab-sized params.
-        self.mtp_projs = nn.ModuleList([
-            nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # Multi-token prediction heads (training only): each is a separate final Block
+        # that branches from the penultimate layer's output and feeds through the shared lm_head.
+        self.mtp_heads = nn.ModuleList([
+            Block(config, layer_idx=config.n_layer - 1)
             for _ in range(config.n_mtp_heads - 1)
         ]) if config.n_mtp_heads > 1 else nn.ModuleList()
         # Per-layer learnable scalars (inspired by modded-nanogpt)
@@ -194,6 +218,11 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # Sampled softmax alias table (non-persistent, rebuilt from frequency file each run)
+        if config.sampled_softmax_n > 0:
+            self.register_buffer('_alias_prob', torch.empty(config.vocab_size), persistent=False)
+            self.register_buffer('_alias_idx', torch.empty(config.vocab_size, dtype=torch.int64), persistent=False)
+            self.register_buffer('_log_q', torch.empty(config.vocab_size), persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -214,13 +243,11 @@ class GPT(nn.Module):
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        for proj in self.mtp_projs:
-            torch.nn.init.eye_(proj.weight)  # start as identity → aux heads match main head, then specialize
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for block in list(self.transformer.h) + list(self.mtp_heads):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -237,7 +264,7 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
-        for block in self.transformer.h:
+        for block in list(self.transformer.h) + list(self.mtp_heads):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
@@ -314,12 +341,12 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings, per-layer scalars, and MTP projs (training-only)
+        # Exclude non-matmul params: embeddings, per-layer scalars, and MTP heads (training-only)
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        mtp_projs_numel = sum(p.numel() for p in self.mtp_projs.parameters())
+        mtp_heads_numel = sum(p.numel() for p in self.mtp_heads.parameters())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          mtp_projs_numel)
+                          mtp_heads_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -346,16 +373,16 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        mtp_projs = sum(p.numel() for p in self.mtp_projs.parameters())
+        mtp_heads = sum(p.numel() for p in self.mtp_heads.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + mtp_projs + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + mtp_heads + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
-            'mtp_projs': mtp_projs,
+            'mtp_heads': mtp_heads,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
             'total': total,
@@ -366,7 +393,7 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_projs.parameters())
+        matrix_params = list(self.transformer.h.parameters()) + list(self.mtp_heads.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -401,6 +428,75 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
+    def init_sampled_softmax(self, token_freqs):
+        """Initialize sampled softmax alias table from token frequency counts.
+        Call after model is materialized on device. Requires sampled_softmax_n > 0."""
+        import numpy as np
+        alpha = self.config.sampled_softmax_alpha
+        freqs = np.asarray(token_freqs, dtype=np.float64)
+        q = freqs ** alpha
+        q /= q.sum()
+        q = np.maximum(q, 1e-10)
+        q /= q.sum()  # renormalize after clamping
+        alias_prob, alias_idx = build_alias_table(q)
+        log_q = torch.log(torch.from_numpy(q.astype(np.float32)))
+        device = self.get_device()
+        self._alias_prob.copy_(alias_prob.to(device))
+        self._alias_idx.copy_(alias_idx.to(device))
+        self._log_q.copy_(log_q.to(device))
+
+    def _alias_sample(self, n):
+        """Sample n indices from the alias table on GPU."""
+        V = self._alias_prob.shape[0]
+        idx = torch.randint(V, (n,), device=self._alias_prob.device)
+        r = torch.rand(n, device=self._alias_prob.device)
+        return torch.where(r < self._alias_prob[idx], idx, self._alias_idx[idx])
+
+    def _sampled_softmax_loss(self, x, targets, softcap):
+        """Compute cross-entropy loss using sampled softmax with log-Q correction.
+        Args:
+            x: hidden states (B, T, C) in autocast dtype
+            targets: target token ids (B, T), -1 = ignore
+            softcap: logit soft-capping value
+        Returns: scalar loss (mean over valid positions)
+        """
+        B, T, C = x.shape
+        N = self.config.sampled_softmax_n
+
+        # 1. Sample shared negatives (fresh draw each call)
+        neg_indices = self._alias_sample(N)  # (N,)
+
+        # 2. Negative logits via efficient matmul
+        neg_logits = F.linear(x, self.lm_head.weight[neg_indices])  # (B, T, N)
+
+        # 3. Positive logit per position (dot product with target's weight vector)
+        pos_weight = self.lm_head.weight[targets.clamp(0)]  # (B, T, C)
+        pos_logits = (x * pos_weight).sum(-1, keepdim=True)  # (B, T, 1)
+
+        # 4. Concatenate: positive at index 0, negatives at 1..N
+        all_logits = torch.cat([pos_logits, neg_logits], dim=-1)  # (B, T, N+1)
+
+        # 5. Cast to fp32, apply softcap
+        all_logits = all_logits.float()
+        all_logits = softcap * torch.tanh(all_logits / softcap)
+
+        # 6. Log-Q correction: subtract log(Q(token)) to make gradients unbiased
+        pos_log_q = self._log_q[targets.clamp(0)].unsqueeze(-1)  # (B, T, 1)
+        neg_log_q = self._log_q[neg_indices]  # (N,)
+        all_logits[:, :, 0:1] = all_logits[:, :, 0:1] - pos_log_q
+        all_logits[:, :, 1:] = all_logits[:, :, 1:] - neg_log_q  # broadcasts over B, T
+
+        # 7. Collision mask: where a negative matches the target, set logit to -inf
+        collision = (neg_indices == targets.unsqueeze(-1))  # (B, T, N)
+        all_logits[:, :, 1:] = all_logits[:, :, 1:].masked_fill(collision, float('-inf'))
+
+        # 8. CE loss with target always at index 0, handle ignore_index=-1
+        ce_targets = torch.zeros(B * T, dtype=torch.long, device=x.device)
+        loss = F.cross_entropy(all_logits.reshape(B * T, -1), ce_targets, reduction='none')
+        valid = (targets.reshape(-1) != -1).float()
+        loss = (loss * valid).sum() / valid.sum().clamp(min=1)
+        return loss
+
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
@@ -416,14 +512,37 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        n_layers = len(self.transformer.h)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            # Save the final layer's input for MTP heads (they branch here)
+            if self.training and i == n_layers - 1 and len(self.mtp_heads) > 0:
+                x_mtp = x
+                ve_mtp = ve
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
+        # Forward the lm_head and compute loss
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+
+        # Sampled softmax path: training only, ~16x cheaper output projection + loss
+        if self.training and self.config.sampled_softmax_n > 0 and targets is not None:
+            loss = self._sampled_softmax_loss(x, targets, softcap)
+            # Multi-token prediction with sampled softmax
+            if len(self.mtp_heads) > 0:
+                window_size = self.window_sizes[-1]
+                aux_losses = []
+                for k, mtp_block in enumerate(self.mtp_heads, start=1):
+                    mtp_x = mtp_block(x_mtp, ve_mtp, cos_sin, window_size, None)
+                    mtp_x = norm(mtp_x)
+                    future_targets = targets[:, k:]  # (B, T-k)
+                    aux_loss = self._sampled_softmax_loss(mtp_x[:, :T-k], future_targets, softcap)
+                    aux_losses.append(aux_loss)
+                loss = loss + self.config.mtp_loss_weight * sum(aux_losses) / len(aux_losses)
+            return loss
+
+        # Full softmax path (inference and evaluation)
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
@@ -431,17 +550,18 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
             V = self.config.vocab_size
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
 
-            # Multi-token prediction: project hidden states per head, then reuse the shared lm_head
-            # for full cross-entropy loss against future tokens. Each mtp_proj learns to transform
-            # hidden states so that lm_head(proj(x)) predicts token t+k+1.
-            if self.training and len(self.mtp_projs) > 0:
+            # Multi-token prediction: each MTP head is a separate final Block that branches
+            # from the same input as the main final layer, then feeds through the shared lm_head.
+            if self.training and len(self.mtp_heads) > 0:
+                window_size = self.window_sizes[-1]
                 aux_losses = []
-                for k, proj in enumerate(self.mtp_projs, start=1):
-                    mtp_logits = self.lm_head(proj(x[:, :T-k]))  # (B, T-k, padded_vocab_size)
+                for k, mtp_block in enumerate(self.mtp_heads, start=1):
+                    mtp_x = mtp_block(x_mtp, ve_mtp, cos_sin, window_size, None)
+                    mtp_x = norm(mtp_x)
+                    mtp_logits = self.lm_head(mtp_x[:, :T-k])
                     mtp_logits = mtp_logits[..., :V]
                     mtp_logits = mtp_logits.float()
                     mtp_logits = softcap * torch.tanh(mtp_logits / softcap)

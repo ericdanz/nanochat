@@ -33,6 +33,12 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "mtp_loss_weight" not in model_config_kwargs:
         model_config_kwargs["mtp_loss_weight"] = 0.2
         log0(f"Patching missing mtp_loss_weight in model config to 0.2")
+    if "sampled_softmax_n" not in model_config_kwargs:
+        model_config_kwargs["sampled_softmax_n"] = 0
+        log0(f"Patching missing sampled_softmax_n in model config to 0")
+    if "sampled_softmax_alpha" not in model_config_kwargs:
+        model_config_kwargs["sampled_softmax_alpha"] = 0.75
+        log0(f"Patching missing sampled_softmax_alpha in model config to 0.75")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
