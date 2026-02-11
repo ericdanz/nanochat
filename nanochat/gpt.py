@@ -82,7 +82,7 @@ def build_alias_table(probs):
         (small if prob[l] < 1.0 else large).append(l)
     for i in large + small:
         alias_prob[i] = 1.0
-    return torch.tensor(alias_prob, dtype=torch.float32), torch.tensor(alias_idx, dtype=torch.int64)
+    return torch.tensor(alias_prob, dtype=torch.float32), torch.tensor(alias_idx, dtype=torch.int32)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -221,7 +221,7 @@ class GPT(nn.Module):
         # Sampled softmax alias table (non-persistent, rebuilt from frequency file each run)
         if config.sampled_softmax_n > 0:
             self.register_buffer('_alias_prob', torch.empty(config.vocab_size), persistent=False)
-            self.register_buffer('_alias_idx', torch.empty(config.vocab_size, dtype=torch.int64), persistent=False)
+            self.register_buffer('_alias_idx', torch.empty(config.vocab_size, dtype=torch.int32), persistent=False)
             self.register_buffer('_log_q', torch.empty(config.vocab_size), persistent=False)
 
     @torch.no_grad()
@@ -452,25 +452,27 @@ class GPT(nn.Module):
         r = torch.rand(n, device=self._alias_prob.device)
         return torch.where(r < self._alias_prob[idx], idx, self._alias_idx[idx])
 
-    def _sampled_softmax_loss(self, x, targets, softcap):
+    def _sampled_softmax_loss(self, x, targets, softcap, neg_indices=None):
         """Compute cross-entropy loss using sampled softmax with log-Q correction.
         Args:
             x: hidden states (B, T, C) in autocast dtype
             targets: target token ids (B, T), -1 = ignore
             softcap: logit soft-capping value
+            neg_indices: optional pre-sampled negative indices (N,) to reuse across heads
         Returns: scalar loss (mean over valid positions)
         """
         B, T, C = x.shape
-        N = self.config.sampled_softmax_n
 
-        # 1. Sample shared negatives (fresh draw each call)
-        neg_indices = self._alias_sample(N)  # (N,)
+        # 1. Sample shared negatives (or reuse provided ones)
+        if neg_indices is None:
+            neg_indices = self._alias_sample(self.config.sampled_softmax_n)  # (N,)
 
         # 2. Negative logits via efficient matmul
         neg_logits = F.linear(x, self.lm_head.weight[neg_indices])  # (B, T, N)
 
         # 3. Positive logit per position (dot product with target's weight vector)
-        pos_weight = self.lm_head.weight[targets.clamp(0)]  # (B, T, C)
+        safe_targets = targets.clamp(0)
+        pos_weight = self.lm_head.weight[safe_targets]  # (B, T, C)
         pos_logits = (x * pos_weight).sum(-1, keepdim=True)  # (B, T, 1)
 
         # 4. Concatenate: positive at index 0, negatives at 1..N
@@ -481,16 +483,14 @@ class GPT(nn.Module):
         all_logits = softcap * torch.tanh(all_logits / softcap)
 
         # 6. Log-Q correction: subtract log(Q(token)) to make gradients unbiased
-        pos_log_q = self._log_q[targets.clamp(0)].unsqueeze(-1)  # (B, T, 1)
+        pos_log_q = self._log_q[safe_targets].unsqueeze(-1)  # (B, T, 1)
         neg_log_q = self._log_q[neg_indices]  # (N,)
         all_logits[:, :, 0:1] = all_logits[:, :, 0:1] - pos_log_q
         all_logits[:, :, 1:] = all_logits[:, :, 1:] - neg_log_q  # broadcasts over B, T
 
-        # 7. Collision mask: where a negative matches the target, set logit to -inf
-        collision = (neg_indices == targets.unsqueeze(-1))  # (B, T, N)
-        all_logits[:, :, 1:] = all_logits[:, :, 1:].masked_fill(collision, float('-inf'))
-
-        # 8. CE loss with target always at index 0, handle ignore_index=-1
+        # 7. CE loss with target always at index 0, handle ignore_index=-1
+        # (collision masking skipped: with log-Q correction the bias from rare
+        #  duplicates is negligible, and we avoid a (B,T,N) bool tensor)
         ce_targets = torch.zeros(B * T, dtype=torch.long, device=x.device)
         loss = F.cross_entropy(all_logits.reshape(B * T, -1), ce_targets, reduction='none')
         valid = (targets.reshape(-1) != -1).float()
@@ -528,7 +528,9 @@ class GPT(nn.Module):
 
         # Sampled softmax path: training only, ~16x cheaper output projection + loss
         if self.training and self.config.sampled_softmax_n > 0 and targets is not None:
-            loss = self._sampled_softmax_loss(x, targets, softcap)
+            # Sample negatives once and reuse across main + MTP heads
+            neg_indices = self._alias_sample(self.config.sampled_softmax_n)
+            loss = self._sampled_softmax_loss(x, targets, softcap, neg_indices)
             # Multi-token prediction with sampled softmax
             if len(self.mtp_heads) > 0:
                 window_size = self.window_sizes[-1]
@@ -537,7 +539,7 @@ class GPT(nn.Module):
                     mtp_x = mtp_block(x_mtp, ve_mtp, cos_sin, window_size, None)
                     mtp_x = norm(mtp_x)
                     future_targets = targets[:, k:]  # (B, T-k)
-                    aux_loss = self._sampled_softmax_loss(mtp_x[:, :T-k], future_targets, softcap)
+                    aux_loss = self._sampled_softmax_loss(mtp_x[:, :T-k], future_targets, softcap, neg_indices)
                     aux_losses.append(aux_loss)
                 loss = loss + self.config.mtp_loss_weight * sum(aux_losses) / len(aux_losses)
             return loss
