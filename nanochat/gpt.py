@@ -487,9 +487,11 @@ class GPT(nn.Module):
         all_logits[:, :, 0:1] = all_logits[:, :, 0:1] - pos_log_q
         all_logits[:, :, 1:] = all_logits[:, :, 1:] - neg_log_q  # broadcasts over B, T
 
-        # 7. CE loss with target always at index 0, handle ignore_index=-1
-        # (collision masking skipped: with log-Q correction the bias from rare
-        #  duplicates is negligible, and we avoid a (B,T,N) bool tensor)
+        # 7. Mask out negatives that collide with the positive target
+        collision_mask = (neg_indices == safe_targets.unsqueeze(-1))  # (B, T, N)
+        all_logits[:, :, 1:].masked_fill_(collision_mask, float('-inf'))
+
+        # 8. CE loss with target always at index 0, handle ignore_index=-1
         # F.cross_entropy internally upcasts bf16→fp32 for numerical stability in logsumexp
         ce_targets = torch.zeros(B * T, dtype=torch.long, device=x.device)
         loss = F.cross_entropy(all_logits.reshape(B * T, -1), ce_targets, reduction='none')
