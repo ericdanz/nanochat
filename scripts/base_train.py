@@ -509,8 +509,11 @@ while True:
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        synchronize(); t_fwd = time.time()  # DEBUG timing
         loss.backward()
+        synchronize(); t_bwd = time.time()  # DEBUG timing
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        t_data = time.time()  # DEBUG timing
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -526,6 +529,9 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    # DEBUG: print component times (remove after diagnosis)
+    if step > 10 and step < 30:
+        print0(f"  DEBUG step {step}: fwd={(t_fwd-t0)*1000:.1f}ms bwd={(t_bwd-t_fwd)*1000:.1f}ms data={(t_data-t_bwd)*1000:.1f}ms opt={(t1-t_data)*1000:.1f}ms")
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
