@@ -489,6 +489,7 @@ class GPT(nn.Module):
 
         # 7. Mask out negatives that collide with the positive target
         collision_mask = (neg_indices == safe_targets.unsqueeze(-1))  # (B, T, N)
+        self._collision_rate = collision_mask.float().mean()
         all_logits[:, :, 1:].masked_fill_(collision_mask, float('-inf'))
 
         # 8. CE loss with target always at index 0, handle ignore_index=-1
