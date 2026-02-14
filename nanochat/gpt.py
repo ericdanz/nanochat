@@ -452,47 +452,43 @@ class GPT(nn.Module):
         r = torch.rand(n, device=self._alias_prob.device)
         return torch.where(r < self._alias_prob[idx], idx, self._alias_idx[idx])
 
-    def _sampled_softmax_loss(self, x, targets, softcap, neg_indices=None):
+    def _sampled_softmax_loss(self, x, targets, softcap, neg_indices, neg_weight, neg_log_q):
         """Compute cross-entropy loss using sampled softmax with log-Q correction.
         Args:
             x: hidden states (B, T, C) in autocast dtype
             targets: target token ids (B, T), -1 = ignore
             softcap: logit soft-capping value
-            neg_indices: optional pre-sampled negative indices (N,) to reuse across heads
+            neg_indices: pre-sampled negative indices (N,)
+            neg_weight: pre-gathered lm_head weights for negatives (N, C)
+            neg_log_q: pre-gathered log-Q values for negatives (N,)
         Returns: scalar loss (mean over valid positions)
         """
         B, T, C = x.shape
 
-        # 1. Sample shared negatives (or reuse provided ones)
-        if neg_indices is None:
-            neg_indices = self._alias_sample(self.config.sampled_softmax_n)  # (N,)
+        # 1. Negative logits via efficient matmul (neg_weight pre-gathered by caller)
+        neg_logits = F.linear(x, neg_weight)  # (B, T, N)
 
-        # 2. Negative logits via efficient matmul
-        neg_logits = F.linear(x, self.lm_head.weight[neg_indices])  # (B, T, N)
-
-        # 3. Positive logit per position (dot product with target's weight vector)
+        # 2. Positive logit per position (dot product with target's weight vector)
         safe_targets = targets.clamp(0)
         pos_weight = self.lm_head.weight[safe_targets]  # (B, T, C)
         pos_logits = (x * pos_weight).sum(-1, keepdim=True)  # (B, T, 1)
 
-        # 4. Concatenate: positive at index 0, negatives at 1..N
+        # 3. Concatenate: positive at index 0, negatives at 1..N
         all_logits = torch.cat([pos_logits, neg_logits], dim=-1)  # (B, T, N+1)
 
-        # 5. Apply softcap in bf16 (only 2049 classes, bf16 precision is sufficient)
+        # 4. Apply softcap in bf16 (only 2049 classes, bf16 precision is sufficient)
         all_logits = softcap * torch.tanh(all_logits / softcap)
 
-        # 6. Log-Q correction: subtract log(Q(token)) to make gradients unbiased
+        # 5. Log-Q correction: subtract log(Q(token)) to make gradients unbiased
         pos_log_q = self._log_q[safe_targets].unsqueeze(-1)  # (B, T, 1)
-        neg_log_q = self._log_q[neg_indices]  # (N,)
         all_logits[:, :, 0:1] = all_logits[:, :, 0:1] - pos_log_q
         all_logits[:, :, 1:] = all_logits[:, :, 1:] - neg_log_q  # broadcasts over B, T
 
-        # 7. Mask out negatives that collide with the positive target
-        collision_mask = (neg_indices == safe_targets.unsqueeze(-1))  # (B, T, N)
-        self._collision_rate = collision_mask.float().mean()
-        all_logits[:, :, 1:].masked_fill_(collision_mask, float('-inf'))
+        # 6. Mask out negatives that collide with the positive target
+        #collision_mask = (neg_indices == safe_targets.unsqueeze(-1))  # (B, T, N)
+        #all_logits[:, :, 1:].masked_fill_(collision_mask, float('-inf'))
 
-        # 8. CE loss with target always at index 0, handle ignore_index=-1
+        # 7. CE loss with target always at index 0, handle ignore_index=-1
         # F.cross_entropy internally upcasts bf16→fp32 for numerical stability in logsumexp
         ce_targets = torch.zeros(B * T, dtype=torch.long, device=x.device)
         loss = F.cross_entropy(all_logits.reshape(B * T, -1), ce_targets, reduction='none')
@@ -531,9 +527,11 @@ class GPT(nn.Module):
 
         # Sampled softmax path: training only, ~16x cheaper output projection + loss
         if self.training and self.config.sampled_softmax_n > 0 and targets is not None:
-            # Sample negatives once and reuse across main + MTP heads
+            # Sample negatives once and pre-gather weights/log-Q for reuse across main + MTP heads
             neg_indices = self._alias_sample(self.config.sampled_softmax_n)
-            loss = self._sampled_softmax_loss(x, targets, softcap, neg_indices)
+            neg_weight = self.lm_head.weight[neg_indices]  # (N, C)
+            neg_log_q = self._log_q[neg_indices]  # (N,)
+            loss = self._sampled_softmax_loss(x, targets, softcap, neg_indices, neg_weight, neg_log_q)
             # Multi-token prediction with sampled softmax
             if len(self.mtp_heads) > 0:
                 window_size = self.window_sizes[-1]
@@ -542,7 +540,7 @@ class GPT(nn.Module):
                     mtp_x = mtp_block(x_mtp, ve_mtp, cos_sin, window_size, None)
                     mtp_x = norm(mtp_x)
                     future_targets = targets[:, k:]  # (B, T-k)
-                    aux_loss = self._sampled_softmax_loss(mtp_x[:, :T-k], future_targets, softcap, neg_indices)
+                    aux_loss = self._sampled_softmax_loss(mtp_x[:, :T-k], future_targets, softcap, neg_indices, neg_weight, neg_log_q)
                     aux_losses.append(aux_loss)
                 loss = loss + self.config.mtp_loss_weight * sum(aux_losses) / len(aux_losses)
             return loss
