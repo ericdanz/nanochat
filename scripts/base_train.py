@@ -410,6 +410,13 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Pre-allocate ~95% of GPU memory to avoid cudaMalloc stalls during training
+if device_type == "cuda":
+    free, total = torch.cuda.mem_get_info()
+    alloc_bytes = int(free * 0.95)
+    _prealloc = torch.empty(alloc_bytes, dtype=torch.uint8, device="cuda")
+    del _prealloc
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
